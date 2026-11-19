@@ -49,6 +49,15 @@ def safe_copy(src, dst):
 ANGLE_FLAG_ENTRY_REMOVED_MILESTONE = 141
 ANGLE_GL_BACKEND_REMOVED_MILESTONE = 152
 VALIDATED_MILESTONES = (152, 153)
+# Pattern presence was checked against M157-M158 during Phase 0-1 diagnostics.
+# Runtime validation is still pending, so this is kept separate from
+# VALIDATED_MILESTONES rather than being presented as fully validated.
+PATTERN_VERIFIED_MILESTONES = (157, 158)
+KNOWN_MILESTONES = VALIDATED_MILESTONES + PATTERN_VERIFIED_MILESTONES
+
+GPU_PATCH_MARKER = "--chromium-gpu-patch-profile="
+GPU_PROFILES = ("compat", "accelerated", "custom")
+DEFAULT_GPU_PROFILE = "compat"
 
 
 def parse_milestone(version):
@@ -187,8 +196,12 @@ class BaseBrowserPatcher:
 
     def is_launcher_patched(self, launcher_path=None):
         """
-        Verify that the launcher is our custom compiled binary that injects --use-angle=gl
-        and is signed by our local certificate (LocalCodeSigner).
+        Verify that the launcher is our custom compiled binary.
+
+        V2 launchers carry a --chromium-gpu-patch-profile=<name> marker and may
+        use any supported profile, so the old requirement that the launcher
+        embed specific --disable-* flags no longer applies. V1 launchers are
+        still recognized for backward compatibility.
         """
         if not launcher_path:
             launcher_path = self.get_launcher_dst()
@@ -198,10 +211,20 @@ class BaseBrowserPatcher:
         try:
             with open(launcher_path, "rb") as f:
                 content = f.read()
-                if b"--use-angle=gl" not in content or b"--disable-video-capture-use-gpu-memory-buffer" not in content or b"ScreenCaptureKitMacScreen" not in content:
-                    return False
         except Exception:
             return False
+
+        if GPU_PATCH_MARKER.encode("utf-8") in content:
+            # V2 launcher: marker is authoritative. Require an angle switch
+            # so a partially compiled/foreign binary is not accepted.
+            if b"--use-angle=" not in content:
+                return False
+        else:
+            # Legacy V1 launcher.
+            if (b"--use-angle=gl" not in content
+                    or b"--disable-video-capture-use-gpu-memory-buffer" not in content
+                    or b"ScreenCaptureKitMacScreen" not in content):
+                return False
 
         res = subprocess.run(["codesign", "-dvvv", launcher_path], capture_output=True, text=True)
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
@@ -351,6 +374,7 @@ class BaseBrowserPatcher:
         """
         milestone = parse_milestone(version)
         lo, hi = VALIDATED_MILESTONES
+        known_hi = max(KNOWN_MILESTONES)
 
         if milestone is None:
             print(f"[*] Could not determine Chromium milestone from version '{version}'.")
@@ -368,19 +392,24 @@ class BaseBrowserPatcher:
                       f"M{ANGLE_FLAG_ENTRY_REMOVED_MILESTONE}, so pass the flag on the")
                 print("     command line rather than setting it in the browser UI.)")
             print("    Patching is still worthwhile for the zero-copy / Skia Graphite fixes.")
-        elif milestone > hi:
-            print(f"    Warning: binary patterns are validated against M{lo}-M{hi}.")
+        elif milestone in PATTERN_VERIFIED_MILESTONES:
+            print(f"    Pattern presence was verified read-only on M{milestone}.")
+            print("    Runtime validation of the patched browser is still pending.")
+        elif milestone > known_hi:
+            print(f"    Warning: binary patterns are validated against M{lo}-M{hi} "
+                  f"(pattern-checked through M{known_hi}).")
             print(f"    M{milestone} is newer - if a pattern below is not found, it has "
                   f"most likely drifted and needs re-deriving.")
 
         return milestone
 
-    def apply_binary_patches(self, version):
+    def apply_binary_patches(self, version, dry_run=False, skip_patches=None):
         fw_bin = self.get_framework_bin(version)
         backup_dir = self.get_backup_dir(version)
         fw_bak = os.path.join(backup_dir, f"{self.framework_binary_name}.original")
+        skip_set = set(skip_patches or ())
 
-        if os.path.exists(fw_bak):
+        if not dry_run and os.path.exists(fw_bak):
             print(f"[*] Resetting to clean original {self.name} framework from backup before patching...")
             safe_copy(fw_bak, fw_bin)
 
@@ -390,44 +419,95 @@ class BaseBrowserPatcher:
 
         milestone = self.report_milestone_context(version)
 
-        print(f"[*] Reading {self.name} framework binary ({os.path.getsize(fw_bin):,} bytes)...")
+        action = "Simulating" if dry_run else "Reading"
+        print(f"[*] {action} {self.name} framework binary ({os.path.getsize(fw_bin):,} bytes)...")
         with open(fw_bin, "rb") as f:
             data = bytearray(f.read())
 
         patches = self.get_patches(version)
         applied_count = 0
+        skipped_count = 0
+        failed_required = []
+        failed_optional = []
 
-        for item in patches:
-            if len(item) == 3:
-                p_name, orig, pat = item
-                idx = data.find(orig)
-                if idx != -1:
-                    data[idx:idx+len(pat)] = pat
-                    print(f"[+] {p_name} applied successfully at {hex(idx)}!")
-                    applied_count += 1
-                else:
-                    if data.find(pat) != -1:
-                        print(f"[*] {p_name} is already applied.")
-                        applied_count += 1
-                    else:
-                        print(f"[!] Warning: {p_name} pattern not found!")
-                        if milestone and milestone > VALIDATED_MILESTONES[1]:
-                            print(f"    (M{milestone} is newer than the validated "
-                                  f"M{VALIDATED_MILESTONES[0]}-M{VALIDATED_MILESTONES[1]} range.)")
-            elif len(item) == 2 and callable(item[1]):
+        for patch_idx, item in enumerate(patches, start=1):
+            optional = False
+            custom_func = None
+            orig = pat = None
+
+            if len(item) == 2 and callable(item[1]):
                 p_name, custom_func = item
+            elif len(item) == 3 and callable(item[1]):
+                p_name, custom_func, optional = item
+            elif len(item) == 3:
+                p_name, orig, pat = item
+            elif len(item) == 4:
+                p_name, orig, pat, optional = item
+            else:
+                print(f"[!] Warning: malformed patch entry: {item!r}")
+                failed_required.append(str(item))
+                continue
+
+            if patch_idx in skip_set:
+                print(f"[*] Skipping {p_name} (--skip-patches).")
+                skipped_count += 1
+                continue
+
+            if custom_func is not None:
                 success = custom_func(data)
                 if success:
                     applied_count += 1
+                elif optional:
+                    failed_optional.append(p_name)
+                    print(f"[!] Optional {p_name} not applied; continuing.")
+                else:
+                    failed_required.append(p_name)
+                    print(f"[!] Required {p_name} not applied.")
+                continue
 
-        if applied_count == len(patches):
-            print(f"[+] All {applied_count}/{len(patches)} patches confirmed/applied. Writing updated binary...")
-            with open(fw_bin, "wb") as f:
-                f.write(data)
-            return True
-        else:
-            print(f"[!] Patching incomplete ({applied_count}/{len(patches)} applied).")
+            idx = data.find(orig)
+            if idx != -1:
+                data[idx:idx+len(pat)] = pat
+                print(f"[+] {p_name} applied successfully at {hex(idx)}!")
+                applied_count += 1
+            elif data.find(pat) != -1:
+                print(f"[*] {p_name} is already applied.")
+                applied_count += 1
+            else:
+                if optional:
+                    failed_optional.append(p_name)
+                    print(f"[!] Optional {p_name} pattern not found; continuing.")
+                else:
+                    failed_required.append(p_name)
+                    print(f"[!] Warning: {p_name} pattern not found!")
+                if milestone and milestone > max(KNOWN_MILESTONES):
+                    print(f"    (M{milestone} is newer than the pattern-checked "
+                          f"M{min(KNOWN_MILESTONES)}-M{max(KNOWN_MILESTONES)} range.)")
+
+        if failed_required:
+            print(f"[!] Patching incomplete: {len(failed_required)} required patch(es) failed.")
+            for p_name in failed_required:
+                print(f"    - {p_name}")
             return False
+
+        if failed_optional:
+            print(f"[*] {len(failed_optional)} optional patch(es) were not applied:")
+            for p_name in failed_optional:
+                print(f"    - {p_name}")
+
+        active_total = len(patches) - skipped_count
+        skip_note = f", {skipped_count} skipped" if skipped_count else ""
+
+        if dry_run:
+            print(f"[+] Dry run complete: all required patches match "
+                  f"({applied_count}/{active_total} confirmed/applied{skip_note}). No binary was modified.")
+            return True
+
+        print(f"[+] All required patches confirmed/applied "
+              f"({applied_count}/{active_total} confirmed/applied{skip_note}). Writing updated binary...")
+        with open(fw_bin, "wb") as f:
+            f.write(data)
+        return True
 
     def install_launcher(self, version):
         launcher_src_path = os.path.join(self.repo_root, self.launcher_src)
@@ -437,9 +517,16 @@ class BaseBrowserPatcher:
             print(f"[!] Error: Launcher source not found at {launcher_src_path}")
             return False
 
-        print(f"[*] Compiling native C launcher for {self.name}...")
+        profile = getattr(self, "gpu_profile", DEFAULT_GPU_PROFILE)
+        if profile not in GPU_PROFILES:
+            print(f"[!] Unknown GPU profile '{profile}', using {DEFAULT_GPU_PROFILE}.")
+            profile = DEFAULT_GPU_PROFILE
+
+        print(f"[*] Compiling native C launcher for {self.name} "
+              f"(default profile: {profile})...")
         tmp_launcher = launcher_dst + ".new"
-        res = run(f'clang -O2 "{launcher_src_path}" -o "{tmp_launcher}"')
+        profile_define = f'-DCHROME_GPU_DEFAULT_PROFILE="{profile}"'
+        res = run(["clang", "-O2", profile_define, launcher_src_path, "-o", tmp_launcher])
         if res.returncode == 0:
             os.replace(tmp_launcher, launcher_dst)
             print(f"[+] {self.name} launcher installed successfully!")
@@ -657,64 +744,272 @@ class BaseBrowserPatcher:
 
         return True
 
-    def probe_gpu_status(self):
-        """Launches a fast, headless WebGL probe to query the active GPU renderer in runtime.
-        Returns:
-            tuple: (status: str, renderer: str)
-            status can be: 'HARDWARE' | 'SOFTWARE' | 'DISABLED' | 'ERROR' | 'TIMEOUT' | 'NOT_FOUND'
+    def probe_features(self):
+        """Run a headless feature probe and return (renderer, features, error).
+
+        The probe covers WebGL/WebGL2, WebGPU, 2D canvas availability, media
+        capability queries for common codecs, and capture API availability.
+        It uses an isolated temporary profile so it does not touch the user's
+        browser session.
         """
         launcher_dst = self.get_launcher_dst()
         if not os.path.exists(launcher_dst):
-            return "NOT_FOUND", f"Executable not found at {launcher_dst}"
+            return "", {}, f"Executable not found at {launcher_dst}"
 
-        import base64, subprocess, re
-        probe_html = (
-            "<!DOCTYPE html><html><body><div id=\"gpu_result\">WAITING</div><script>\n"
-            "try {\n"
-            "  const c = document.createElement('canvas');\n"
-            "  const gl = c.getContext('webgl') || c.getContext('experimental-webgl');\n"
-            "  if (!gl) {\n"
-            "    document.getElementById('gpu_result').innerText = 'DISABLED';\n"
-            "  } else {\n"
-            "    const ext = gl.getExtension('WEBGL_debug_renderer_info');\n"
-            "    const r = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'ENABLED_NO_INFO';\n"
-            "    document.getElementById('gpu_result').innerText = r;\n"
-            "  }\n"
-            "} catch(e) {\n"
-            "  document.getElementById('gpu_result').innerText = 'ERROR:' + e.message;\n"
-            "}\n"
-            "</script></body></html>"
-        )
+        import base64
+        import html
+        import json
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        probe_html = """<!DOCTYPE html><html><body>
+<div id="gpu_result">WAITING</div>
+<div id="features">{}</div>
+<script>
+(function () {
+  const out = {};
+  function publish() {
+    document.getElementById('gpu_result').textContent = out.renderer || 'UNKNOWN';
+    document.getElementById('features').textContent = JSON.stringify(out);
+  }
+
+  try {
+    const c = document.createElement('canvas');
+    const gl2 = c.getContext('webgl2');
+    const gl = gl2 || c.getContext('webgl') || c.getContext('experimental-webgl');
+    out.webgl = !!gl;
+    out.webgl2 = !!gl2;
+    if (gl) {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      out.renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'ENABLED_NO_INFO';
+      out.vendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : '';
+    } else {
+      out.renderer = 'DISABLED';
+    }
+  } catch (e) {
+    out.renderer = 'ERROR:' + e.message;
+  }
+
+  try {
+    out.canvas2d = !!document.createElement('canvas').getContext('2d');
+  } catch (e) {
+    out.canvas2d = false;
+  }
+
+  /* Publish the synchronous results immediately. Async probes may be slow or
+     unavailable in headless mode and must not leave the page at WAITING. */
+  publish();
+
+  (async function () {
+    try {
+      out.webgpu = !!navigator.gpu;
+      if (navigator.gpu) {
+        const adapter = await Promise.race([
+          navigator.gpu.requestAdapter(),
+          new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 2000); })
+        ]);
+        out.webgpuAdapter = !!adapter;
+        if (adapter && adapter.info) {
+          out.webgpuInfo = {
+            vendor: adapter.info.vendor,
+            architecture: adapter.info.architecture,
+            device: adapter.info.device,
+            description: adapter.info.description
+          };
+        }
+      }
+    } catch (e) {
+      out.webgpu = false;
+      out.webgpuError = String(e);
+    }
+    publish();
+
+    try {
+      out.userMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      out.displayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+    } catch (e) {}
+
+    out.media = {};
+    const codecs = {
+      h264: 'video/mp4; codecs="avc1.42E01E"',
+      vp9: 'video/mp4; codecs="vp09.00.10.08"',
+      av1: 'video/mp4; codecs="av01.0.04M.08"',
+      hevc: 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+    };
+    if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
+      for (const name of Object.keys(codecs)) {
+        try {
+          out.media[name] = await Promise.race([
+            navigator.mediaCapabilities.decodingInfo({
+              type: 'file',
+              video: {
+                contentType: codecs[name],
+                width: 1920,
+                height: 1080,
+                bitrate: 4000000,
+                framerate: 30
+              }
+            }),
+            new Promise(function (resolve) { setTimeout(function () { resolve({ error: 'timeout' }); }, 2000); })
+          ]);
+        } catch (e) {
+          out.media[name] = { error: String(e) };
+        }
+      }
+    } else {
+      out.mediaError = 'mediaCapabilities unavailable';
+    }
+    publish();
+  })();
+})();
+</script>
+</body></html>"""
+
         b64 = base64.b64encode(probe_html.encode("utf-8")).decode("ascii")
         data_uri = f"data:text/html;base64,{b64}"
 
         # Chrome, Brave, and Helium support --headless=new; Opera works best with --headless
         flag_headless = "--headless" if self.slug == "opera" else "--headless=new"
-        cmd = [launcher_dst, flag_headless, "--dump-dom", data_uri]
+        tmpdir = tempfile.mkdtemp(prefix="chrome-gpu-probe-")
+        cmd = [
+            launcher_dst,
+            flag_headless,
+            "--no-first-run",
+            "--no-default-browser-check",
+            f"--user-data-dir={tmpdir}",
+            "--virtual-time-budget=8000",
+            "--run-all-compositor-stages-before-draw",
+            "--dump-dom",
+            data_uri,
+        ]
 
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-            m = re.search(r"<div id=\"gpu_result\">(.*?)</div>", res.stdout)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            features = {}
+            m = re.search(r'<div id="features">(.*?)</div>', res.stdout, re.DOTALL)
             if m:
-                renderer = m.group(1).strip()
-                if renderer == "DISABLED":
-                    return "DISABLED", "Hardware acceleration / WebGL is disabled by Chromium"
-                elif any(s in renderer for s in ["SwiftShader", "Software", "llvmpipe"]):
-                    return "SOFTWARE", renderer
-                elif renderer.startswith("ERROR:"):
-                    return "ERROR", renderer
-                else:
-                    return "HARDWARE", renderer
-            return "UNKNOWN", "Could not parse probe output"
-        except subprocess.TimeoutExpired:
-            return "TIMEOUT", "Process timed out during GPU probe"
-        except Exception as e:
-            return "ERROR", str(e)
+                raw = html.unescape(m.group(1)).strip()
+                try:
+                    features = json.loads(raw)
+                except Exception:
+                    features = {"raw": raw}
 
-    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False):
+            renderer = str(features.get("renderer", "")).strip()
+            if not renderer:
+                g = re.search(r'<div id="gpu_result">(.*?)</div>', res.stdout, re.DOTALL)
+                if g:
+                    renderer = html.unescape(g.group(1)).strip()
+
+            if not features and not renderer:
+                return "", {}, "Could not parse probe output"
+            return renderer, features, None
+        except subprocess.TimeoutExpired:
+            return "", {}, "Process timed out during GPU/feature probe"
+        except Exception as e:
+            return "", {}, str(e)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def probe_gpu_status(self):
+        """Launches a headless probe to query the active GPU renderer in runtime.
+        Returns:
+            tuple: (status: str, renderer: str)
+            status can be: 'HARDWARE' | 'SOFTWARE' | 'DISABLED' | 'ERROR' | 'TIMEOUT' | 'NOT_FOUND'
+        """
+        renderer, features, err = self.probe_features()
+        if err:
+            if "not found" in err.lower():
+                return "NOT_FOUND", err
+            if "timed out" in err.lower():
+                return "TIMEOUT", err
+            return "ERROR", err
+
+        if not features:
+            return "UNKNOWN", err or "Could not parse probe output"
+        if renderer == "DISABLED" or not features.get("webgl", True):
+            return "DISABLED", "Hardware acceleration / WebGL is disabled by Chromium"
+        if any(s in renderer for s in ["SwiftShader", "Software", "llvmpipe"]):
+            return "SOFTWARE", renderer
+        if renderer.startswith("ERROR:"):
+            return "ERROR", renderer
+        return "HARDWARE", renderer
+
+    def get_launcher_flags(self):
+        """Return injected GPU switches found in the launcher binary."""
+        launcher_dst = self.get_launcher_dst()
+        if not os.path.exists(launcher_dst):
+            return []
+
+        try:
+            res = subprocess.run(["strings", launcher_dst], capture_output=True, text=True, timeout=10)
+        except Exception:
+            return []
+
+        prefixes = (
+            "--use-angle", "--ignore-gpu-blocklist", "--disable-", "--enable-",
+            "--ui-", "--chromium-gpu-patch-profile",
+        )
+        flags = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if line.startswith(prefixes) and line not in flags:
+                flags.append(line)
+        return flags
+
+    def diagnose(self, version, skip_patches=None):
+        """Read-only diagnostics: launcher flags, pattern matches, feature probe."""
+        print(f"\n{'='*60}")
+        print(f" [{self.name}] Diagnostics")
+        print(f" Target : {self.app_path}")
+        print(f" Version: {version}")
+        print(f"{'='*60}")
+
+        flags = self.get_launcher_flags()
+        profile = "stock/unknown"
+        for flag in flags:
+            if flag.startswith(GPU_PATCH_MARKER):
+                val = flag.split("=", 1)[1].strip()
+                profile = val if val else "v2 (runtime-selectable)"
+                break
+        print(f"[*] Launcher profile: {profile}")
+        if flags:
+            print("[*] Injected launcher flags:")
+            for flag in flags:
+                print(f"    {flag}")
+        else:
+            print("[*] No injected GPU flags found (stock launcher or unsupported binary).")
+
+        print("\n[*] Binary pattern dry-run:")
+        pattern_ok = self.apply_binary_patches(version, dry_run=True, skip_patches=skip_patches)
+
+        print("\n[*] Runtime feature probe:")
+        renderer, features, err = self.probe_features()
+        if err:
+            print(f"[!] Probe error: {err}")
+        else:
+            print(f"    Renderer: {renderer or 'unknown'}")
+            try:
+                import json
+                print("    Features:")
+                print(json.dumps(features, indent=6, sort_keys=True))
+            except Exception:
+                print(f"    {features}")
+
+        print(f"\n[*] Diagnostic result: required binary patterns "
+              f"{'OK' if pattern_ok else 'MISSING/FAILED'}.")
+        return 0 if pattern_ok else 1
+
+    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False, gpu_profile=DEFAULT_GPU_PROFILE, dry_run=False, diagnose_only=False, skip_patches=None):
         if not self.is_installed():
             print(f"[-] {self.name} is not installed at {self.app_path}.")
             return 1
+
+        self.gpu_profile = gpu_profile if gpu_profile in GPU_PROFILES else DEFAULT_GPU_PROFILE
+        self.skip_patches = set(skip_patches or ())
+        if gpu_profile not in GPU_PROFILES:
+            print(f"[!] Unknown GPU profile '{gpu_profile}', using {DEFAULT_GPU_PROFILE}.")
 
         if fix_permissions:
             print(f"\n{'='*60}")
@@ -736,6 +1031,14 @@ class BaseBrowserPatcher:
         if restore_mode:
             success = self.restore(current_ver)
             return 0 if success else 1
+
+        if diagnose_only:
+            return self.diagnose(current_ver, skip_patches=self.skip_patches)
+
+        if dry_run:
+            skip_msg = f", skip patches: {sorted(self.skip_patches)}" if self.skip_patches else ""
+            print(f"[*] Dry-run mode: no files will be modified (profile: {self.gpu_profile}{skip_msg}).")
+            return 0 if self.apply_binary_patches(current_ver, dry_run=True, skip_patches=self.skip_patches) else 1
 
         if test_gpu:
             print(f"[*] Running headless WebGL hardware acceleration probe for {self.name}...")
@@ -785,7 +1088,7 @@ class BaseBrowserPatcher:
         self.pre_patch_hook(current_ver)
 
         # 3. Binary patching
-        ok = self.apply_binary_patches(current_ver)
+        ok = self.apply_binary_patches(current_ver, skip_patches=self.skip_patches)
         if not ok:
             print(f"[!] Binary patching failed for {self.name}. Rolling back to backup...")
             self.restore(current_ver)

@@ -44,21 +44,21 @@ class BravePatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if Pattern 1, Pattern 2, Pattern 7, and Pattern 8 are patched
+        # 3. Check if Pattern 1, Pattern 2, and Pattern 7 are patched.
+        # Patch 8 (desktop-capture CPU fallback) is optional and does not gate
+        # "patched" status so ScreenCaptureKit can be tested when skipped.
+        skip_patches = getattr(self, "skip_patches", set())
         p1_patched = bytes.fromhex("84 c0 90 90 80 7d b8 00 74 cd 48 8b 45 b0")
         p2_patched = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00", re.DOTALL)
         p7_applied = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00", re.DOTALL)
-        p8_applied = re.compile(rb"\x31\xc0\xc3(?:\xe5|\x90)(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x83\x3f\x01\x75.(?:.|\n){1,6}\x48\x83[\x78-\x7f]\x08\xfd", re.DOTALL)
         try:
             with open(fw_bin, "rb") as f:
                 data = f.read()
-                if data.find(p1_patched) == -1 and not re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\x48\x83\xf9\x09(?:.|\n){1,60}\x84\xc0\x90\x90\x80\x7d(.)\x00", data, re.DOTALL):
+                if 1 not in skip_patches and data.find(p1_patched) == -1 and not re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\x48\x83\xf9\x09(?:.|\n){1,60}\x84\xc0\x90\x90\x80\x7d(.)\x00", data, re.DOTALL):
                     return False
-                if not p2_patched.search(data) and not re.search(rb"\x84\xc0\xe9.{4}\x90\x83\x7d.\x00\x0f\x85", data, re.DOTALL):
+                if 2 not in skip_patches and not p2_patched.search(data) and not re.search(rb"\x84\xc0\xe9.{4}\x90\x83\x7d.\x00\x0f\x85", data, re.DOTALL):
                     return False
-                if not p7_applied.search(data):
-                    return False
-                if not p8_applied.search(data):
+                if 7 not in skip_patches and not p7_applied.search(data):
                     return False
         except Exception:
             return False
@@ -176,7 +176,7 @@ class BravePatcher(BaseBrowserPatcher):
                 data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
                 print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied successfully at {hex(jump_pos)}!")
                 return True
-            p4_applied = re.compile(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b\xbb\x88\x00\x00\x00", re.DOTALL)
+            p4_applied = re.compile(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b", re.DOTALL)
             if p4_applied.search(data) or data.find(b"\x85\xc0\x90\x90\x90\x90\x90\x90\x48\x8b\xbb\x88\x00\x00\x00") != -1:
                 print("[*] Patch 4 (Seatbelt IsSandboxed) is already applied.")
                 return True
@@ -225,7 +225,7 @@ class BravePatcher(BaseBrowserPatcher):
             if data.find(p6_153_pat) != -1 or data.find(p6_pre_pat) != -1:
                 print("[*] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
-            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec\x30\x01\x00\x00", re.DOTALL)
+            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             if p6_applied_re.search(data):
                 print("[*] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
@@ -238,12 +238,13 @@ class BravePatcher(BaseBrowserPatcher):
                 print(f"[+] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied successfully at {hex(idx)}!")
                 return True
 
-            # 2. Dynamic pattern specifically anchored to ScopedEGLSurfaceIOSurface::ValidateTarget (stack frame 0x130)
-            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec\x30\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00", re.DOTALL)
+            # 2. Dynamic pattern anchored to ScopedEGLSurfaceIOSurface::ValidateTarget
+            #    (M153-M158+: stack frame 0x100..0x1ff, cmp esi, GL_TEXTURE_2D (0xde1), cmp ..., EGL_TEXTURE_2D (0x305f))
+            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             m = p6_re.search(data)
             if m:
                 offset = m.start()
-                data[offset : offset + 20] = p6_153_pat
+                data[offset : offset + 4] = b"\xb0\x01\xc3\x90"
                 print(f"[+] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied dynamically at {hex(offset)}!")
                 return True
 
@@ -304,5 +305,5 @@ class BravePatcher(BaseBrowserPatcher):
             ("Patch 5 (IOSurfaceImageBackingFactory target 0x84f5)", patch_p5_factory_target),
             ("Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget)", patch_p6_validate_target),
             ("Patch 7 (IOSurfaceImageBacking gl_target_ = 0x84f5)", patch_p7_backing_target),
-            ("Patch 8 (CreateDesktopCaptureDeviceMac fallback to CPU capturer)", patch_p8_desktop_capture)
+            ("Patch 8 (CreateDesktopCaptureDeviceMac fallback to CPU capturer)", patch_p8_desktop_capture, True),
         ]

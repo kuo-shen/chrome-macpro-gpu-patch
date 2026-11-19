@@ -106,6 +106,34 @@ python3 patch.py helium
 | `python3 patch.py --restore helium` | Khôi phục lại Helium Browser gốc ban đầu từ backup. |
 | `python3 patch.py --restore thorium` | Khôi phục lại Thorium Browser gốc ban đầu từ backup. |
 
+#### 🔎 Chẩn đoán & Hồ sơ GPU (Phase 0–1)
+Phiên bản patcher hiện hỗ trợ chế độ chẩn đoán chỉ đọc và các hồ sơ (profile) launcher. Mặc định vẫn là **`compat`** — bộ cờ an toàn hiện tại; chưa bật lại bất kỳ tính năng tăng tốc nào.
+
+```bash
+# Mô phỏng vá nhị phân trong bộ nhớ và báo cáo kết quả từng pattern.
+python3 patch.py chrome --dry-run
+
+# In profile/cờ launcher, chạy dry-run pattern và probe WebGL/WebGPU/media.
+python3 patch.py chrome --diagnose
+
+# Biên dịch launcher với profile mặc định mong muốn (compat là mặc định).
+python3 patch.py chrome --profile compat
+```
+
+Có thể ghi đè profile lúc chạy mà không cần vá lại:
+
+```bash
+CHROME_GPU_PROFILE=custom "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --chromium-gpu-patch-profile=custom
+CHROME_GPU_DISABLE_FEATURES="Foo,Bar"
+CHROME_GPU_ENABLE_FEATURES="Baz"
+CHROME_GPU_EXTRA_FLAGS="--some-switch=value"
+```
+
+> [!NOTE]
+> Các profile `accelerated` và `custom` chỉ mới được định nghĩa cho giai đoạn tiếp theo. Chúng **chưa được kiểm chứng** và không được chọn mặc định. `--dry-run` và `--diagnose` không bao giờ sửa đổi trình duyệt.
+
+
 #### 💻 Ứng Dụng Electron (Chỉ Áp Dụng Khi Opt-In Thủ Công — Bỏ qua trong `all`):
 > [!NOTE]
 > Ứng dụng Electron bắt buộc **chỉ chạy khi chỉ định rõ (Opt-In)** nhằm bảo vệ chữ ký bản quyền của nhà phát triển, Team ID và phân quyền Keychain macOS (tài khoản GitHub Copilot, mật khẩu Git, SSH keys).

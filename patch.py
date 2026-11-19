@@ -14,6 +14,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from patchers import AVAILABLE_PATCHERS, OPT_IN_PATCHERS, ALL_PATCHERS
+from patchers.base import GPU_PROFILES, DEFAULT_GPU_PROFILE
 
 def check_for_updates():
     """Checks GitHub for a newer version via built-in curl. Never hangs or blocks."""
@@ -114,6 +115,10 @@ def main():
   python3 patch.py vscode --update-app # Update VS Code to latest release and re-patch
   python3 patch.py --list           # List supported browsers and opt-in apps
   python3 patch.py --check all      # Check patch status for all browsers
+  python3 patch.py --dry-run chrome # Simulate binary patching without modifying anything
+  python3 patch.py --diagnose chrome # Launcher flags + pattern report + feature probe
+  python3 patch.py chrome --profile compat # Compile launcher with the stable compat profile
+  python3 patch.py brave --skip-patches 8 --force # Patch Brave while keeping CreateDesktopCaptureDeviceMac intact
   python3 patch.py --test-gpu all   # Probe live WebGL hardware acceleration across all browsers
   python3 patch.py chrome --test-gpu # Test Google Chrome live GPU status only
   python3 patch.py --update         # Pull latest version of this tool from GitHub
@@ -133,6 +138,12 @@ def main():
                         help="Explicit path to the .app bundle (e.g. /Applications/Visual Studio Code.app)")
     parser.add_argument("--list", action="store_true", help="List supported browsers and opt-in apps")
     parser.add_argument("--check", action="store_true", help="Check if target is already patched on disk")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate binary pattern patching without writing anything")
+    parser.add_argument("--diagnose", action="store_true", help="Print launcher profile/flags, binary pattern match report, and a headless feature probe")
+    parser.add_argument("--profile", choices=GPU_PROFILES, default=DEFAULT_GPU_PROFILE,
+                        help="GPU profile compiled as the launcher default (compat is the stable default; accelerated/custom are experimental)")
+    parser.add_argument("--skip-patches", type=str, default=None,
+                        help="Comma-separated 1-based binary patch numbers to skip (e.g. '8' or '5,6,7,8')")
     parser.add_argument("--test-gpu", action="store_true", help="Run a live headless WebGL probe to verify active GPU hardware acceleration")
     parser.add_argument("--restore", action="store_true", help="Restore original binaries/executables from backup")
     parser.add_argument("--fix-permissions", action="store_true",
@@ -160,7 +171,7 @@ def main():
             print(f"    {REPO_URL}/releases/latest")
         return 0
 
-    if not args.auto and not args.check and not args.test_gpu and not args.fix_permissions:
+    if not args.auto and not args.check and not args.test_gpu and not args.fix_permissions and not args.dry_run and not args.diagnose:
         check_for_updates()
 
     if args.list:
@@ -225,6 +236,17 @@ def main():
         print(f"[!] Unknown target: '{target}'. Available targets: {', '.join(valid_targets)}, all")
         return 1
 
+    skip_patches = set()
+    if args.skip_patches:
+        for token in args.skip_patches.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if not token.isdigit() or int(token) < 1:
+                print(f"[!] Error: Invalid patch number '{token}' in --skip-patches (expected positive integers like '8' or '5,6,7,8').")
+                return 1
+            skip_patches.add(int(token))
+
     overall_exit_code = 0
     for patcher in targets_to_run:
         code = patcher.run_patch(
@@ -235,12 +257,16 @@ def main():
             force=args.force,
             test_gpu=args.test_gpu,
             fix_permissions=args.fix_permissions,
-            auto_yes=args.yes
+            auto_yes=args.yes,
+            gpu_profile=args.profile,
+            dry_run=args.dry_run,
+            diagnose_only=args.diagnose,
+            skip_patches=skip_patches
         )
         if code != 0:
             overall_exit_code = code
 
-    if overall_exit_code == 0 and not args.check and not args.test_gpu and not args.restore and not args.auto and not args.fix_permissions:
+    if overall_exit_code == 0 and not args.check and not args.test_gpu and not args.restore and not args.auto and not args.fix_permissions and not args.dry_run and not args.diagnose:
         check_and_prompt_launchagent(auto_yes=args.yes)
 
     return overall_exit_code

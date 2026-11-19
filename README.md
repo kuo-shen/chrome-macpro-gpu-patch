@@ -106,6 +106,50 @@ python3 patch.py helium
 | `python3 patch.py --restore helium` | Restores original unpatched Helium Browser from backup. |
 | `python3 patch.py --restore thorium` | Restores original unpatched Thorium Browser from backup. |
 
+#### 🔎 Diagnostics & GPU Profiles (Phase 0–1)
+The patcher now supports read-only diagnostics and named launcher profiles. The default remains **`compat`**, which is the existing stable flag set; no acceleration feature has been re-enabled yet.
+
+```bash
+# Simulate binary patching in memory and report every pattern result.
+python3 patch.py chrome --dry-run
+
+# Print launcher profile/flags, run the pattern dry-run, and probe WebGL/WebGPU/media features.
+python3 patch.py chrome --diagnose
+
+# Compile the launcher with a specific default profile (compat is the default).
+python3 patch.py chrome --profile compat
+
+# Optionally skip specific 1-based binary patches (e.g. keep CreateDesktopCaptureDeviceMac intact).
+python3 patch.py brave --skip-patches 8 --force
+```
+
+Available profiles:
+
+| Profile | Intended use |
+| :--- | :--- |
+| `compat` | Current stable GL workaround + all existing mitigations (default). |
+| `accelerated` | Experimental: forced ANGLE GL with the blanket feature disables removed. |
+| `custom` | Experimental: base GL flags plus environment-controlled overrides. |
+
+The profile can be overridden at runtime without repatching:
+
+```bash
+# Environment variable
+CHROME_GPU_PROFILE=custom "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+
+# Command-line switch
+"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --chromium-gpu-patch-profile=custom
+
+# Additional per-feature overrides, merged with the selected profile
+CHROME_GPU_DISABLE_FEATURES="Foo,Bar"
+CHROME_GPU_ENABLE_FEATURES="Baz"
+CHROME_GPU_EXTRA_FLAGS="--some-switch=value"
+```
+
+> [!NOTE]
+> `accelerated` and `custom` are defined for the next phase of work. They are **not** validated yet and are not selected by default. `--dry-run` and `--diagnose` never modify the browser.
+
+
 #### 💻 Electron Apps (Opt-In Only — Skipped by `all`):
 > [!NOTE]
 > Electron apps are **strictly opt-in** to protect original developer code signatures, Team IDs, and macOS Keychain entitlements (GitHub Copilot, Git credentials, passwords).
@@ -210,7 +254,7 @@ The [`auto_patch_chrome.py`](auto_patch_chrome.py) script uses **Pattern Scannin
 | **5** | `IOSurfaceImageBackingFactory` | `48 8d b5 78 ... 89 44 24 10` | `48 8d b5 78 ... 41 b8 f5 84 00 00` | Sets IOSurface texture target to `GL_TEXTURE_RECTANGLE` (`0x84f5`). |
 | **6** | `ScopedEGLSurfaceIOSurface::ValidateTarget` | `55 48 89 e5 41 56 ...` | `b0 01 c3 90 ...` | Patches validation to always return `true` (`mov al, 1; ret`). |
 | **7** | `IOSurfaceImageBacking` constructor | `8b 45 d0 89 83 88 01 00 00` | `c7 83 88 01 00 00 f5 84 00 00` | Forces `gl_target_ = 0x84f5` across all IOSurface backing instances. |
-| **8** | `CreateDesktopCaptureDeviceMac` | `55 48 89 e5 41 56 53 83 3f 01 ...` | `31 c0 c3 ...` | Forces return of `nullptr` (`xor eax, eax; ret`), falling back to WebRTC CPU desktop capturer to eliminate green screen sharing preview artifacts. |
+| **8** | `CreateDesktopCaptureDeviceMac` | `55 48 89 e5 41 56 53 83 3f 01 ...` | `31 c0 c3 ...` | Forces return of `nullptr` (`xor eax, eax; ret`), falling back to WebRTC CPU desktop capturer to eliminate green screen sharing preview artifacts. **Optional in Phase 0–1:** failure to match no longer aborts the whole patch. |
 
 ---
 
@@ -370,6 +414,7 @@ chrome-macpro-gpu-patch/
 │       ├── base.py                 # BaseElectronPatcher engine (wrapper shim, signature preserving)
 │       └── vscode.py               # Visual Studio Code patcher & automated updater
 ├── chrome_main.c                   # Google Chrome native C launcher (flag injection)
+├── gpu_profiles.h                  # Shared compat/accelerated/custom launcher profiles
 ├── brave_main.c                    # Brave Browser native C launcher (flag injection)
 ├── opera_main.c                    # Opera Browser native C launcher (flag injection)
 ├── helium_main.c                   # Helium Browser native C launcher (flag injection)

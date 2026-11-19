@@ -5,21 +5,7 @@
 #include <libgen.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
-
-static const char *kInjectedFlags[] = {
-    "--use-angle=gl",
-    "--ignore-gpu-blocklist",
-    "--disable-features=SkiaGraphite,MediaGmbVideoFramePoolMappableSI,ScreenCaptureKitMacScreen,kScreenCaptureKitMacScreen,ScreenCaptureKitDeviceMac",
-    "--disable-zero-copy",
-    "--ui-disable-zero-copy",
-    "--disable-gpu-memory-buffer-compositor-resources",
-    "--disable-gpu-memory-buffer-video-frames",
-    "--disable-video-capture-use-gpu-memory-buffer",
-    "--disable-accelerated-video-decode",
-    "--disable-accelerated-2d-canvas",
-    "--disable-partial-raster",
-};
-#define NUM_INJECTED_FLAGS (sizeof(kInjectedFlags) / sizeof(kInjectedFlags[0]))
+#include "gpu_profiles.h"
 
 int main(int argc, char *argv[]) {
     char exec_path[1024];
@@ -43,38 +29,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Track which flags to inject */
-    const char *to_add[NUM_INJECTED_FLAGS];
-    int add_count = 0;
-
-    for (size_t f = 0; f < NUM_INJECTED_FLAGS; f++) {
-        const char *flag = kInjectedFlags[f];
-        size_t prefix_len = strcspn(flag, "=");
-        int found = 0;
-        for (int i = 1; i < argc; i++) {
-            if (strncmp(argv[i], flag, prefix_len) == 0) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            to_add[add_count++] = flag;
-        }
+    /* Select the compat/accelerated/custom profile and merge user flags. */
+    const char *profile_name = gpu_profile_name_from_env_or_argv(argc, argv);
+    const char **new_argv = NULL;
+    int new_argc = gpu_build_argv(profile_name, argc, argv, &new_argv);
+    if (new_argc < 0 || !new_argv) {
+        fprintf(stderr, "Failed to build GPU profile arguments\n");
+        return 1;
     }
 
-    int new_argc = argc + add_count;
-    const char **new_argv = malloc((new_argc + 1) * sizeof(char *));
-    new_argv[0] = argv[0];
-    int idx = 1;
-
-    for (int i = 0; i < add_count; i++) {
-        new_argv[idx++] = to_add[i];
-    }
-
-    for (int i = 1; i < argc; i++) {
-        new_argv[idx++] = argv[i];
-    }
-    new_argv[idx] = NULL;
-
-    exit(chrome_main(idx, new_argv));
+    exit(chrome_main(new_argc, new_argv));
 }

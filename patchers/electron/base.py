@@ -185,7 +185,7 @@ class BaseElectronPatcher(BaseBrowserPatcher):
     def probe_gpu_status(self):
         return "UNSUPPORTED", "Headless WebGL probe is not applicable to Electron apps (verify in-app via Help > Toggle Developer Tools > Console: document.createElement('canvas').getContext('webgl'))"
 
-    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False):
+    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False, gpu_profile=None, dry_run=False, diagnose_only=False, skip_patches=None):
         if not self.is_installed():
             print(f"[-] {self.name} is not installed at {self.app_path}.")
             return 1
