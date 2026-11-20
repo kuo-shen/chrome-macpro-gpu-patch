@@ -48,11 +48,10 @@ def safe_copy(src, dst):
 #       gl_factory.cc returns kGLImplementationNone and GPU init fails.
 ANGLE_FLAG_ENTRY_REMOVED_MILESTONE = 141
 ANGLE_GL_BACKEND_REMOVED_MILESTONE = 152
-VALIDATED_MILESTONES = (152, 153)
-# Pattern presence was checked against M157-M158 during Phase 0-1 diagnostics.
-# Runtime validation is still pending, so this is kept separate from
-# VALIDATED_MILESTONES rather than being presented as fully validated.
-PATTERN_VERIFIED_MILESTONES = (157, 158)
+VALIDATED_MILESTONES = (152, 153, 158)
+# Pattern presence was checked against M157 during Phase 0-1 diagnostics;
+# M158 (Brave v158.1.100.58) is fully runtime-validated on hardware.
+PATTERN_VERIFIED_MILESTONES = (157,)
 KNOWN_MILESTONES = VALIDATED_MILESTONES + PATTERN_VERIFIED_MILESTONES
 
 GPU_PATCH_MARKER = "--chromium-gpu-patch-profile="
@@ -83,6 +82,9 @@ class BaseBrowserPatcher:
     launcher_src = ""
     backup_base_dir = ""
     certificate_name = "LocalCodeSigner"
+    default_gpu_profile = DEFAULT_GPU_PROFILE
+    default_skip_patches = ()
+    use_dynamic_angle = False
 
     def __init__(self, repo_root=None, app_path=None):
         if repo_root is None:
@@ -373,7 +375,7 @@ class BaseBrowserPatcher:
         Skia Graphite mitigations remain useful.
         """
         milestone = parse_milestone(version)
-        lo, hi = VALIDATED_MILESTONES
+        lo, hi = min(VALIDATED_MILESTONES), max(VALIDATED_MILESTONES)
         known_hi = max(KNOWN_MILESTONES)
 
         if milestone is None:
@@ -517,16 +519,21 @@ class BaseBrowserPatcher:
             print(f"[!] Error: Launcher source not found at {launcher_src_path}")
             return False
 
-        profile = getattr(self, "gpu_profile", DEFAULT_GPU_PROFILE)
+        profile = getattr(self, "gpu_profile", None) or self.default_gpu_profile
         if profile not in GPU_PROFILES:
-            print(f"[!] Unknown GPU profile '{profile}', using {DEFAULT_GPU_PROFILE}.")
-            profile = DEFAULT_GPU_PROFILE
+            print(f"[!] Unknown GPU profile '{profile}', using {self.default_gpu_profile}.")
+            profile = self.default_gpu_profile
 
+        dyn_note = ", dynamic ANGLE: on" if self.use_dynamic_angle else ""
         print(f"[*] Compiling native C launcher for {self.name} "
-              f"(default profile: {profile})...")
+              f"(default profile: {profile}{dyn_note})...")
         tmp_launcher = launcher_dst + ".new"
         profile_define = f'-DCHROME_GPU_DEFAULT_PROFILE="{profile}"'
-        res = run(["clang", "-O2", profile_define, launcher_src_path, "-o", tmp_launcher])
+        clang_cmd = ["clang", "-O2", profile_define]
+        if self.use_dynamic_angle:
+            clang_cmd.append("-DCHROME_GPU_USE_DYNAMIC_ANGLE")
+        clang_cmd.extend([launcher_src_path, "-o", tmp_launcher])
+        res = run(clang_cmd)
         if res.returncode == 0:
             os.replace(tmp_launcher, launcher_dst)
             print(f"[+] {self.name} launcher installed successfully!")
@@ -948,8 +955,9 @@ class BaseBrowserPatcher:
             return []
 
         prefixes = (
-            "--use-angle", "--ignore-gpu-blocklist", "--disable-", "--enable-",
-            "--ui-", "--chromium-gpu-patch-profile",
+            "--use-angle", "--use-dynamic-angle", "--ignore-gpu-blocklist",
+            "--disable-", "--enable-", "--ui-", "--chromium-gpu-patch-profile",
+            "chromium-gpu-patch-default-profile=",
         )
         flags = []
         for line in res.stdout.splitlines():
@@ -960,20 +968,36 @@ class BaseBrowserPatcher:
 
     def diagnose(self, version, skip_patches=None):
         """Read-only diagnostics: launcher flags, pattern matches, feature probe."""
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
         print(f"\n{'='*60}")
         print(f" [{self.name}] Diagnostics")
         print(f" Target : {self.app_path}")
         print(f" Version: {version}")
         print(f"{'='*60}")
 
-        flags = self.get_launcher_flags()
+        raw_flags = self.get_launcher_flags()
+        default_profile_marker = None
+        flags = []
+        for flag in raw_flags:
+            if flag.startswith("chromium-gpu-patch-default-profile="):
+                default_profile_marker = flag.split("=", 1)[1].strip()
+            else:
+                flags.append(flag)
+
         profile = "stock/unknown"
         for flag in flags:
             if flag.startswith(GPU_PATCH_MARKER):
                 val = flag.split("=", 1)[1].strip()
-                profile = val if val else "v2 (runtime-selectable)"
+                if val:
+                    profile = val
+                elif default_profile_marker:
+                    profile = f"v2 (default: {default_profile_marker})"
+                else:
+                    profile = "v2 (runtime-selectable)"
                 break
-        print(f"[*] Launcher profile: {profile}")
+        dynamic_angle = "--use-dynamic-angle" in flags
+        print(f"[*] Launcher profile: {profile} (dynamic ANGLE: {'yes' if dynamic_angle else 'no'})")
         if flags:
             print("[*] Injected launcher flags:")
             for flag in flags:
@@ -989,10 +1013,23 @@ class BaseBrowserPatcher:
         if err:
             print(f"[!] Probe error: {err}")
         else:
-            print(f"    Renderer: {renderer or 'unknown'}")
+            print(f"    Renderer      : {renderer or 'unknown'}")
+            print(f"    WebGL / 2D    : webgl={features.get('webgl')}, canvas2d={features.get('canvas2d')}, webgpu={features.get('webgpuAdapter')}")
+            print(f"    Media capture : getUserMedia={features.get('userMedia')}, getDisplayMedia={features.get('displayMedia')}")
+            media = features.get("media")
+            if isinstance(media, dict) and media:
+                codec_bits = []
+                for cname in ("h264", "hevc", "vp9", "av1"):
+                    info = media.get(cname)
+                    if isinstance(info, dict):
+                        sup = "yes" if info.get("supported") else "no"
+                        pe = "hw" if info.get("powerEfficient") else "sw"
+                        codec_bits.append(f"{cname}={sup}({pe})")
+                if codec_bits:
+                    print(f"    Video decode  : {', '.join(codec_bits)}")
             try:
                 import json
-                print("    Features:")
+                print("    Full probe:")
                 print(json.dumps(features, indent=6, sort_keys=True))
             except Exception:
                 print(f"    {features}")
@@ -1001,15 +1038,17 @@ class BaseBrowserPatcher:
               f"{'OK' if pattern_ok else 'MISSING/FAILED'}.")
         return 0 if pattern_ok else 1
 
-    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False, gpu_profile=DEFAULT_GPU_PROFILE, dry_run=False, diagnose_only=False, skip_patches=None):
+    def run_patch(self, auto=False, notify_user=False, check_only=False, restore_mode=False, force=False, test_gpu=False, fix_permissions=False, auto_yes=False, gpu_profile=None, dry_run=False, diagnose_only=False, skip_patches=None):
         if not self.is_installed():
             print(f"[-] {self.name} is not installed at {self.app_path}.")
             return 1
 
-        self.gpu_profile = gpu_profile if gpu_profile in GPU_PROFILES else DEFAULT_GPU_PROFILE
-        self.skip_patches = set(skip_patches or ())
-        if gpu_profile not in GPU_PROFILES:
-            print(f"[!] Unknown GPU profile '{gpu_profile}', using {DEFAULT_GPU_PROFILE}.")
+        effective_profile = self.default_gpu_profile if gpu_profile is None else gpu_profile
+        if effective_profile not in GPU_PROFILES:
+            print(f"[!] Unknown GPU profile '{effective_profile}', using {self.default_gpu_profile}.")
+            effective_profile = self.default_gpu_profile
+        self.gpu_profile = effective_profile
+        self.skip_patches = set(self.default_skip_patches) if skip_patches is None else set(skip_patches)
 
         if fix_permissions:
             print(f"\n{'='*60}")

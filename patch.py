@@ -118,7 +118,8 @@ def main():
   python3 patch.py --dry-run chrome # Simulate binary patching without modifying anything
   python3 patch.py --diagnose chrome # Launcher flags + pattern report + feature probe
   python3 patch.py chrome --profile compat # Compile launcher with the stable compat profile
-  python3 patch.py brave --skip-patches 8 --force # Patch Brave while keeping CreateDesktopCaptureDeviceMac intact
+  python3 patch.py brave --profile compat --force # Patch Brave with compat fallback as default
+  python3 patch.py brave --diagnose # Show Brave launcher profile, pattern status, and GPU/media probe
   python3 patch.py --test-gpu all   # Probe live WebGL hardware acceleration across all browsers
   python3 patch.py chrome --test-gpu # Test Google Chrome live GPU status only
   python3 patch.py --update         # Pull latest version of this tool from GitHub
@@ -140,10 +141,10 @@ def main():
     parser.add_argument("--check", action="store_true", help="Check if target is already patched on disk")
     parser.add_argument("--dry-run", action="store_true", help="Simulate binary pattern patching without writing anything")
     parser.add_argument("--diagnose", action="store_true", help="Print launcher profile/flags, binary pattern match report, and a headless feature probe")
-    parser.add_argument("--profile", choices=GPU_PROFILES, default=DEFAULT_GPU_PROFILE,
-                        help="GPU profile compiled as the launcher default (compat is the stable default; accelerated/custom are experimental)")
+    parser.add_argument("--profile", "--gpu-profile", dest="profile", choices=GPU_PROFILES, default=None,
+                        help="GPU profile compiled as the launcher default (Brave defaults to accelerated; other browsers default to compat)")
     parser.add_argument("--skip-patches", type=str, default=None,
-                        help="Comma-separated 1-based binary patch numbers to skip (e.g. '8' or '5,6,7,8')")
+                        help="Comma-separated 1-based binary patch numbers to skip (e.g. '8' or '5,6,7,8'; Brave defaults to 5,6,7,8)")
     parser.add_argument("--test-gpu", action="store_true", help="Run a live headless WebGL probe to verify active GPU hardware acceleration")
     parser.add_argument("--restore", action="store_true", help="Restore original binaries/executables from backup")
     parser.add_argument("--fix-permissions", action="store_true",
@@ -236,8 +237,9 @@ def main():
         print(f"[!] Unknown target: '{target}'. Available targets: {', '.join(valid_targets)}, all")
         return 1
 
-    skip_patches = set()
-    if args.skip_patches:
+    skip_patches = None
+    if args.skip_patches is not None:
+        skip_patches = set()
         for token in args.skip_patches.split(","):
             token = token.strip()
             if not token:

@@ -24,15 +24,26 @@ class BravePatcher(BaseBrowserPatcher):
     launcher_name = "Brave Browser"
     launcher_src = "brave_main.c"
     backup_base_dir = "~/.brave_macpro_backups"
+    default_gpu_profile = "accelerated"
+    default_skip_patches = (5, 6, 7, 8)
+    use_dynamic_angle = True
+    angle_dylibs_dir = "angle_dylibs_tex2d"
 
     def is_already_patched(self, version):
         ver_dir = self.get_ver_dir(version)
         fw_bin = self.get_framework_bin(version)
         lib_egl = os.path.join(ver_dir, "Libraries/libEGL.dylib")
+        lib_gles = os.path.join(ver_dir, "Libraries/libGLESv2.dylib")
         launcher_dst = self.get_launcher_dst()
         gpu_helper = os.path.join(ver_dir, "Helpers/Brave Browser Helper (GPU).app")
 
-        if not os.path.exists(fw_bin) or not os.path.exists(lib_egl) or not os.path.exists(launcher_dst) or not os.path.exists(gpu_helper):
+        if (
+            not os.path.exists(fw_bin)
+            or not os.path.exists(lib_egl)
+            or not os.path.exists(lib_gles)
+            or not os.path.exists(launcher_dst)
+            or not os.path.exists(gpu_helper)
+        ):
             return False
 
         # 1. Check if Launcher is compiled and signed with LocalCodeSigner
@@ -44,10 +55,11 @@ class BravePatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if Pattern 1, Pattern 2, and Pattern 7 are patched.
-        # Patch 8 (desktop-capture CPU fallback) is optional and does not gate
-        # "patched" status so ScreenCaptureKit can be tested when skipped.
-        skip_patches = getattr(self, "skip_patches", set())
+        # 3. Check required binary patches (Patches 1-2; Patch 7 only if not skipped).
+        # With angle_dylibs_tex2d/ + --use-dynamic-angle, Patches 5-8 are skipped by default.
+        skip_patches = getattr(self, "skip_patches", None)
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
         p1_patched = bytes.fromhex("84 c0 90 90 80 7d b8 00 74 cd 48 8b 45 b0")
         p2_patched = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00", re.DOTALL)
         p7_applied = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00", re.DOTALL)
@@ -69,13 +81,16 @@ class BravePatcher(BaseBrowserPatcher):
         ver_dir = self.get_ver_dir(version)
         lib_dir = os.path.join(ver_dir, "Libraries")
         os.makedirs(lib_dir, exist_ok=True)
-        ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
+        ref_angle_lib = os.path.join(self.repo_root, self.angle_dylibs_dir)
+        if not os.path.isdir(ref_angle_lib):
+            print(f"[!] Warning: {self.angle_dylibs_dir}/ not found; falling back to angle_dylibs/")
+            ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
 
         for dylib in ["libEGL.dylib", "libGLESv2.dylib"]:
             src = os.path.join(ref_angle_lib, dylib)
             dst = os.path.join(lib_dir, dylib)
             if os.path.exists(src):
-                print(f"[*] Copying clean {dylib} to {version}...")
+                print(f"[*] Copying {self.angle_dylibs_dir}/{dylib} to {version}...")
                 safe_copy(src, dst)
             else:
                 print(f"[!] Warning: Reference dylib not found at {src}")

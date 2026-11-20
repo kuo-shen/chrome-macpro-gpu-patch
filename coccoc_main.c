@@ -29,7 +29,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Select the compat/accelerated/custom profile and merge user flags. */
+    /* Select the compat/metal/accelerated profile and merge user flags. */
     const char *profile_name = gpu_profile_name_from_env_or_argv(argc, argv);
     const char **new_argv = NULL;
     int new_argc = gpu_build_argv(profile_name, argc, argv, &new_argv);

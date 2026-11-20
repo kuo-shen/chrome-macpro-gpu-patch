@@ -6,9 +6,15 @@
  *   2. --chromium-gpu-patch-profile=<name> command-line switch
  *   3. CHROME_GPU_DEFAULT_PROFILE compile-time default (compat)
  *
- * "compat" is the current stable flag set. "accelerated" and "custom" are
- * experimental profiles reserved for the feature-reinstatement work; they are
- * intentionally not selected by default.
+ * "compat" is the conservative fallback flag set. "accelerated" enables full
+ * GPU hardware acceleration (VideoToolbox decode, GMB video frames, 2D canvas,
+ * partial raster, webcam GMB, ScreenCaptureKit, and zero-copy) while keeping
+ * SkiaGraphite disabled on legacy OCLP Metal drivers. "custom" is a minimal
+ * profile for ad-hoc flag testing.
+ *
+ * Defining CHROME_GPU_USE_DYNAMIC_ANGLE at compile time injects
+ * --use-dynamic-angle so Chromium loads the bundled Libraries/libEGL.dylib and
+ * libGLESv2.dylib (e.g. our GL_TEXTURE_2D IOSurface-bridged ANGLE CGL build).
  */
 #ifndef GPU_PROFILES_H
 #define GPU_PROFILES_H
@@ -27,8 +33,15 @@
 #define CHROME_GPU_DEFAULT_PROFILE "compat"
 #endif
 
+/* Embedded marker read by `patch.py --diagnose` to report the compiled default. */
+static const char kGpuDefaultProfileMarker[] __attribute__((used)) =
+    "chromium-gpu-patch-default-profile=" CHROME_GPU_DEFAULT_PROFILE;
+
 static const char *const kGpuCompatFlags[] = {
     "--use-angle=gl",
+#ifdef CHROME_GPU_USE_DYNAMIC_ANGLE
+    "--use-dynamic-angle",
+#endif
     "--ignore-gpu-blocklist",
     "--disable-features=SkiaGraphite,MediaGmbVideoFramePoolMappableSI,ScreenCaptureKitMacScreen,kScreenCaptureKitMacScreen,ScreenCaptureKitDeviceMac",
     "--disable-zero-copy",
@@ -43,11 +56,18 @@ static const char *const kGpuCompatFlags[] = {
 
 static const char *const kGpuAcceleratedFlags[] = {
     "--use-angle=gl",
+#ifdef CHROME_GPU_USE_DYNAMIC_ANGLE
+    "--use-dynamic-angle",
+#endif
     "--ignore-gpu-blocklist",
+    "--disable-features=SkiaGraphite",
 };
 
 static const char *const kGpuCustomFlags[] = {
     "--use-angle=gl",
+#ifdef CHROME_GPU_USE_DYNAMIC_ANGLE
+    "--use-dynamic-angle",
+#endif
     "--ignore-gpu-blocklist",
 };
 

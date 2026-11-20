@@ -116,29 +116,27 @@ python3 patch.py chrome --dry-run
 # Print launcher profile/flags, run the pattern dry-run, and probe WebGL/WebGPU/media features.
 python3 patch.py chrome --diagnose
 
-# Compile the launcher with a specific default profile (compat is the default).
+# Compile the launcher with a specific default profile (Brave defaults to accelerated; others default to compat).
 python3 patch.py chrome --profile compat
-
-# Optionally skip specific 1-based binary patches (e.g. keep CreateDesktopCaptureDeviceMac intact).
-python3 patch.py brave --skip-patches 8 --force
+python3 patch.py brave --profile compat --force
 ```
 
 Available profiles:
 
 | Profile | Intended use |
 | :--- | :--- |
-| `compat` | Current stable GL workaround + all existing mitigations (default). |
-| `accelerated` | Experimental: forced ANGLE GL with the blanket feature disables removed. |
-| `custom` | Experimental: base GL flags plus environment-controlled overrides. |
+| `compat` | Conservative GL workaround with all disable mitigations (default for Chrome/Opera/Vivaldi/etc.; fallback for Brave). |
+| `accelerated` | Validated on Brave M158 with `angle_dylibs_tex2d/` + `--use-dynamic-angle`: reinstates VideoToolbox hardware decode, GMB video frames, 2D canvas, partial raster, webcam GMB, ScreenCaptureKit, and Zero-Copy (only `SkiaGraphite` disabled). Default for Brave. |
+| `custom` | Minimal base GL flags plus environment-controlled overrides for ad-hoc testing. |
 
 The profile can be overridden at runtime without repatching:
 
 ```bash
 # Environment variable
-CHROME_GPU_PROFILE=custom "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+CHROME_GPU_PROFILE=compat "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 
 # Command-line switch
-"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --chromium-gpu-patch-profile=custom
+"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --chromium-gpu-patch-profile=compat
 
 # Additional per-feature overrides, merged with the selected profile
 CHROME_GPU_DISABLE_FEATURES="Foo,Bar"
@@ -147,7 +145,7 @@ CHROME_GPU_EXTRA_FLAGS="--some-switch=value"
 ```
 
 > [!NOTE]
-> `accelerated` and `custom` are defined for the next phase of work. They are **not** validated yet and are not selected by default. `--dry-run` and `--diagnose` never modify the browser.
+> Brave uses `angle_dylibs_tex2d/` (reproducible from `patches/angle_cgl_iosurface_tex2d.patch`), `--use-dynamic-angle`, and skips binary Patches 5–8 automatically. `--dry-run` and `--diagnose` never modify the browser.
 
 
 #### 💻 Electron Apps (Opt-In Only — Skipped by `all`):

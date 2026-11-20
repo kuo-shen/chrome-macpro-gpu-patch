@@ -1,0 +1,1239 @@
+diff --git a/src/libANGLE/renderer/gl/ContextGL.cpp b/src/libANGLE/renderer/gl/ContextGL.cpp
+index def9fb1..c2769d1 100644
+--- a/src/libANGLE/renderer/gl/ContextGL.cpp
++++ b/src/libANGLE/renderer/gl/ContextGL.cpp
+@@ -13,6 +13,7 @@
+ #include "libANGLE/Context.h"
+ #include "libANGLE/Context.inl.h"
+ #include "libANGLE/PixelLocalStorage.h"
++#include "libANGLE/Surface.h"
+ #include "libANGLE/renderer/gl/BufferGL.h"
+ #include "libANGLE/renderer/gl/CompilerGL.h"
+ #include "libANGLE/renderer/gl/FenceNVGL.h"
+@@ -29,6 +30,7 @@
+ #include "libANGLE/renderer/gl/SemaphoreGL.h"
+ #include "libANGLE/renderer/gl/ShaderGL.h"
+ #include "libANGLE/renderer/gl/StateManagerGL.h"
++#include "libANGLE/renderer/gl/SurfaceGL.h"
+ #include "libANGLE/renderer/gl/SyncGL.h"
+ #include "libANGLE/renderer/gl/TextureGL.h"
+ #include "libANGLE/renderer/gl/TransformFeedbackGL.h"
+@@ -44,6 +46,95 @@ GLsizei GetDrawAdjustedInstanceCount(const gl::ProgramExecutable *executable)
+     return usesMultiview ? executable->getNumViews() : 0;
+ }
+ 
++angle::Result SyncActiveNativeSurfacesBeforeDraw(const gl::Context *context,
++                                                 StateManagerGL *stateManager)
++{
++    const gl::State &glState                = context->getState();
++    const gl::ProgramExecutable *executable = glState.getProgramExecutable();
++    bool anySynced                          = false;
++
++    if (executable != nullptr)
++    {
++        const gl::ActiveTexturesCache &textures     = glState.getActiveTexturesCache();
++        const gl::ActiveTextureMask &activeTextures = executable->getActiveSamplersMask();
++        for (size_t textureUnitIndex : activeTextures)
++        {
++            gl::Texture *texture = textures[textureUnitIndex];
++            if (texture != nullptr)
++            {
++                egl::Surface *boundSurface = texture->getBoundSurface();
++                if (boundSurface != nullptr)
++                {
++                    if (GetImplAs<SurfaceGL>(boundSurface)->syncFromNativeSurfaceIfNeeded(context))
++                    {
++                        anySynced = true;
++                    }
++                }
++            }
++        }
++    }
++
++    // Also sync destination color attachments before drawing (for blending / scissored /
++    // partial-raster read-modify-write onto an IOSurface updated elsewhere).
++    const gl::Framebuffer *drawFBO = glState.getDrawFramebuffer();
++    if (drawFBO != nullptr && !drawFBO->isDefault())
++    {
++        for (const gl::FramebufferAttachment &attachment : drawFBO->getColorAttachments())
++        {
++            if (attachment.isAttached() && attachment.type() == GL_TEXTURE)
++            {
++                gl::Texture *texture = attachment.getTexture();
++                if (texture != nullptr)
++                {
++                    egl::Surface *boundSurface = texture->getBoundSurface();
++                    if (boundSurface != nullptr)
++                    {
++                        if (GetImplAs<SurfaceGL>(boundSurface)
++                                ->syncFromNativeSurfaceIfNeeded(context))
++                        {
++                            anySynced = true;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    if (anySynced)
++    {
++        ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                          gl::state::DirtyBits().set(),
++                                          gl::state::ExtendedDirtyBits(),
++                                          gl::state::ExtendedDirtyBits().set()));
++    }
++
++    return angle::Result::Continue;
++}
++
++void MarkDrawFramebufferNativeSurfacesDirty(const gl::State &glState)
++{
++    const gl::Framebuffer *drawFBO = glState.getDrawFramebuffer();
++    if (drawFBO == nullptr || drawFBO->isDefault())
++    {
++        return;
++    }
++    for (const gl::FramebufferAttachment &attachment : drawFBO->getColorAttachments())
++    {
++        if (attachment.isAttached() && attachment.type() == GL_TEXTURE)
++        {
++            gl::Texture *texture = attachment.getTexture();
++            if (texture != nullptr)
++            {
++                egl::Surface *boundSurface = texture->getBoundSurface();
++                if (boundSurface != nullptr)
++                {
++                    GetImplAs<SurfaceGL>(boundSurface)->markDirtyForNativeWriteBack();
++                }
++            }
++        }
++    }
++}
++
+ GLsizei GetInstancedDrawAdjustedInstanceCount(const gl::ProgramExecutable *executable,
+                                               GLsizei instanceCount)
+ {
+@@ -340,6 +431,9 @@ ANGLE_INLINE angle::Result ContextGL::setDrawArraysState(const gl::Context *cont
+         ANGLE_TRY(stateManager->setPrimitiveRestartIndex(context, primitiveRestartIndex));
+     }
+ 
++    ANGLE_TRY(SyncActiveNativeSurfacesBeforeDraw(context, getStateManager()));
++    MarkDrawFramebufferNativeSurfacesDirty(context->getState());
++
+     return angle::Result::Continue;
+ }
+ 
+@@ -385,6 +479,9 @@ ANGLE_INLINE angle::Result ContextGL::setDrawElementsState(const gl::Context *co
+ 
+     validateState(StateTypes{StateType::GlobalState, StateType::VAOState});
+ 
++    ANGLE_TRY(SyncActiveNativeSurfacesBeforeDraw(context, getStateManager()));
++    MarkDrawFramebufferNativeSurfacesDirty(context->getState());
++
+     return angle::Result::Continue;
+ }
+ 
+@@ -768,6 +865,8 @@ angle::Result ContextGL::drawArraysIndirect(const gl::Context *context,
+                                             gl::PrimitiveMode mode,
+                                             const void *indirect)
+ {
++    ANGLE_TRY(SyncActiveNativeSurfacesBeforeDraw(context, getStateManager()));
++    MarkDrawFramebufferNativeSurfacesDirty(context->getState());
+     ANGLE_GL_TRY(context, getFunctions()->drawArraysIndirect(ToGLenum(mode), indirect));
+     mRenderer->markWorkSubmitted();
+ 
+@@ -779,6 +878,8 @@ angle::Result ContextGL::drawElementsIndirect(const gl::Context *context,
+                                               gl::DrawElementsType type,
+                                               const void *indirect)
+ {
++    ANGLE_TRY(SyncActiveNativeSurfacesBeforeDraw(context, getStateManager()));
++    MarkDrawFramebufferNativeSurfacesDirty(context->getState());
+     ANGLE_GL_TRY(context,
+                  getFunctions()->drawElementsIndirect(ToGLenum(mode), ToGLenum(type), indirect));
+     mRenderer->markWorkSubmitted();
+@@ -1099,6 +1200,7 @@ void ContextGL::flushIfNecessaryBeforeDeleteTextures()
+ 
+ void ContextGL::markWorkSubmitted()
+ {
++    MarkDrawFramebufferNativeSurfacesDirty(mState);
+     mRenderer->markWorkSubmitted();
+ }
+ 
+diff --git a/src/libANGLE/renderer/gl/ContextGL.h b/src/libANGLE/renderer/gl/ContextGL.h
+index c7fc06c..9386c39 100644
+--- a/src/libANGLE/renderer/gl/ContextGL.h
++++ b/src/libANGLE/renderer/gl/ContextGL.h
+@@ -292,6 +292,7 @@ class ContextGL : public ContextImpl
+     void flushIfNecessaryBeforeDeleteTextures();
+ 
+     void markWorkSubmitted();
++    virtual void flushDirtyNativeSurfaces(const gl::Context *context) {}
+ 
+     bool hasNativeParallelCompile();
+ 
+diff --git a/src/libANGLE/renderer/gl/FramebufferGL.cpp b/src/libANGLE/renderer/gl/FramebufferGL.cpp
+index 2b4657a..1585829 100644
+--- a/src/libANGLE/renderer/gl/FramebufferGL.cpp
++++ b/src/libANGLE/renderer/gl/FramebufferGL.cpp
+@@ -14,6 +14,7 @@
+ #include "libANGLE/ErrorStrings.h"
+ #include "libANGLE/FramebufferAttachment.h"
+ #include "libANGLE/State.h"
++#include "libANGLE/Surface.h"
+ #include "libANGLE/Texture.h"
+ #include "libANGLE/angletypes.h"
+ #include "libANGLE/formatutils.h"
+@@ -25,6 +26,7 @@
+ #include "libANGLE/renderer/gl/FunctionsGL.h"
+ #include "libANGLE/renderer/gl/RenderbufferGL.h"
+ #include "libANGLE/renderer/gl/StateManagerGL.h"
++#include "libANGLE/renderer/gl/SurfaceGL.h"
+ #include "libANGLE/renderer/gl/TextureGL.h"
+ #include "libANGLE/renderer/gl/formatutilsgl.h"
+ #include "libANGLE/renderer/gl/renderergl_utils.h"
+@@ -610,6 +612,37 @@ bool IsEmulatedAlphaChannelTextureAttachment(const gl::FramebufferAttachment *at
+     return textureGL->hasEmulatedAlphaChannel(attachment->getTextureImageIndex());
+ }
+ 
++angle::Result SyncFramebufferNativeSurfaces(const gl::Context *context,
++                                            const gl::FramebufferState &fbState,
++                                            StateManagerGL *stateManager)
++{
++    bool anySynced = false;
++    for (const gl::FramebufferAttachment &attachment : fbState.getColorAttachments())
++    {
++        if (attachment.isAttached() && attachment.type() == GL_TEXTURE)
++        {
++            if (gl::Texture *tex = attachment.getTexture())
++            {
++                if (egl::Surface *surf = tex->getBoundSurface())
++                {
++                    if (GetImplAs<SurfaceGL>(surf)->syncFromNativeSurfaceIfNeeded(context))
++                    {
++                        anySynced = true;
++                    }
++                }
++            }
++        }
++    }
++    if (anySynced)
++    {
++        ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                          gl::state::DirtyBits().set(),
++                                          gl::state::ExtendedDirtyBits(),
++                                          gl::state::ExtendedDirtyBits().set()));
++    }
++    return angle::Result::Continue;
++}
++
+ FramebufferGL::FramebufferGL(const gl::FramebufferState &data,
+                              GLuint id,
+                              bool emulatedAlpha,
+@@ -731,6 +764,11 @@ angle::Result FramebufferGL::clear(const gl::Context *context, GLbitfield mask)
+     const FunctionsGL *functions = GetFunctionsGL(context);
+     StateManagerGL *stateManager = GetStateManagerGL(context);
+ 
++    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && context->getState().isScissorTestEnabled())
++    {
++        ANGLE_TRY(SyncFramebufferNativeSurfaces(context, mState, stateManager));
++    }
++
+     syncClearState(context, mask);
+     stateManager->bindFramebuffer(GL_FRAMEBUFFER, mFramebufferID);
+ 
+@@ -916,6 +954,23 @@ angle::Result FramebufferGL::readPixels(const gl::Context *context,
+ 
+     // Clip read area to framebuffer.
+     const auto *readAttachment = mState.getReadPixelsAttachment(format);
++    if (readAttachment != nullptr && readAttachment->isAttached() &&
++        readAttachment->type() == GL_TEXTURE)
++    {
++        if (gl::Texture *tex = readAttachment->getTexture())
++        {
++            if (egl::Surface *surf = tex->getBoundSurface())
++            {
++                if (GetImplAs<SurfaceGL>(surf)->syncFromNativeSurfaceIfNeeded(context))
++                {
++                    ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                                      gl::state::DirtyBits().set(),
++                                                      gl::state::ExtendedDirtyBits(),
++                                                      gl::state::ExtendedDirtyBits().set()));
++                }
++            }
++        }
++    }
+     const gl::Extents fbSize   = readAttachment->getSize();
+     const gl::Rectangle fbRect(0, 0, fbSize.width, fbSize.height);
+     gl::Rectangle clippedArea;
+@@ -1068,6 +1123,30 @@ angle::Result FramebufferGL::blit(const gl::Context *context,
+ 
+     const FramebufferAttachment *colorReadAttachment = sourceFramebuffer->getReadColorAttachment();
+ 
++    if (colorReadAttachment != nullptr && colorReadAttachment->isAttached() &&
++        colorReadAttachment->type() == GL_TEXTURE)
++    {
++        if (gl::Texture *tex = colorReadAttachment->getTexture())
++        {
++            if (egl::Surface *surf = tex->getBoundSurface())
++            {
++                if (GetImplAs<SurfaceGL>(surf)->syncFromNativeSurfaceIfNeeded(context))
++                {
++                    ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                                      gl::state::DirtyBits().set(),
++                                                      gl::state::ExtendedDirtyBits(),
++                                                      gl::state::ExtendedDirtyBits().set()));
++                }
++            }
++        }
++    }
++
++    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && destFramebuffer != nullptr &&
++        !destFramebuffer->isDefault())
++    {
++        ANGLE_TRY(SyncFramebufferNativeSurfaces(context, destFramebuffer->getState(), stateManager));
++    }
++
+     GLsizei readAttachmentSamples = 0;
+     if (colorReadAttachment != nullptr)
+     {
+@@ -1144,6 +1223,7 @@ angle::Result FramebufferGL::blit(const gl::Context *context,
+ 
+     if (blitMask == 0)
+     {
++        contextGL->markWorkSubmitted();
+         return angle::Result::Continue;
+     }
+ 
+diff --git a/src/libANGLE/renderer/gl/SurfaceGL.h b/src/libANGLE/renderer/gl/SurfaceGL.h
+index b956079..8fe2b42 100644
+--- a/src/libANGLE/renderer/gl/SurfaceGL.h
++++ b/src/libANGLE/renderer/gl/SurfaceGL.h
+@@ -28,6 +28,17 @@ class SurfaceGL : public SurfaceImpl
+                                      const gl::ImageIndex &imageIndex) override;
+ 
+     virtual bool hasEmulatedAlphaChannel() const;
++
++    // Hooks for native surfaces (e.g. macOS IOSurface bridged from GL_TEXTURE_RECTANGLE to
++    // GL_TEXTURE_2D) to synchronize external writes before GPU reads and flush GPU writes back.
++    virtual bool syncFromNativeSurfaceIfNeeded(const gl::Context *context) { return false; }
++    virtual void markDirtyForNativeWriteBack() {}
++    virtual void syncToNativeSurfaceIfDirty(const gl::Context *context) {}
++    virtual angle::Result postBindTexImage(const gl::Context *context, GLuint textureID)
++    {
++        return angle::Result::Continue;
++    }
++    virtual void onTextureReleased(const gl::Context *context) {}
+ };
+ 
+ }  // namespace rx
+diff --git a/src/libANGLE/renderer/gl/SyncGL.cpp b/src/libANGLE/renderer/gl/SyncGL.cpp
+index d807a3f..db3b2c1 100644
+--- a/src/libANGLE/renderer/gl/SyncGL.cpp
++++ b/src/libANGLE/renderer/gl/SyncGL.cpp
+@@ -39,7 +39,8 @@ angle::Result SyncGL::set(const gl::Context *context, GLenum condition, GLbitfie
+ {
+     ASSERT(condition == GL_SYNC_GPU_COMMANDS_COMPLETE && flags == 0);
+     ContextGL *contextGL = GetImplAs<ContextGL>(context);
+-    mSyncObject          = mRenderer->getFunctions()->fenceSync(condition, flags);
++    contextGL->flushDirtyNativeSurfaces(context);
++    mSyncObject = mRenderer->getFunctions()->fenceSync(condition, flags);
+     ANGLE_CHECK(contextGL, mSyncObject != 0, "glFenceSync failed to create a GLsync object.",
+                 GL_OUT_OF_MEMORY);
+     mDeferredBufferDeletionSerial = mRenderer->getStateManager()->onFenceSync();
+diff --git a/src/libANGLE/renderer/gl/TextureGL.cpp b/src/libANGLE/renderer/gl/TextureGL.cpp
+index 92019eb..9893d4e 100644
+--- a/src/libANGLE/renderer/gl/TextureGL.cpp
++++ b/src/libANGLE/renderer/gl/TextureGL.cpp
+@@ -300,6 +300,7 @@ TextureGL::~TextureGL()
+ 
+ void TextureGL::onDestroy(const gl::Context *context)
+ {
++    mBoundSurface = nullptr;
+     GetImplAs<ContextGL>(context)->flushIfNecessaryBeforeDeleteTextures();
+     clearVirtualLevels(context);
+     StateManagerGL *stateManager = GetStateManagerGL(context);
+@@ -1612,6 +1613,19 @@ angle::Result TextureGL::setSubImage(const gl::Context *context,
+     StateManagerGL *stateManager      = GetStateManagerGL(context);
+     const angle::FeaturesGL &features = GetFeaturesGL(context);
+ 
++    if (mBoundSurface != nullptr)
++    {
++        SurfaceGL *surfaceGL = GetImplAs<SurfaceGL>(mBoundSurface);
++        if (surfaceGL->syncFromNativeSurfaceIfNeeded(context))
++        {
++            ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                              gl::state::DirtyBits().set(),
++                                              gl::state::ExtendedDirtyBits(),
++                                              gl::state::ExtendedDirtyBits().set()));
++        }
++        surfaceGL->markDirtyForNativeWriteBack();
++    }
++
+     const gl::InternalFormat &originalInternalFormatInfo = *mState.getImageDesc(index).format.info;
+     nativegl::TexSubImageFormat texSubImageFormat =
+         nativegl::GetTexSubImageFormat(functions, features, format, type);
+@@ -2810,6 +2824,42 @@ angle::Result TextureGL::copySubImage(const gl::Context *context,
+     StateManagerGL *stateManager      = GetStateManagerGL(context);
+     const angle::FeaturesGL &features = GetFeaturesGL(context);
+ 
++    bool anySynced = false;
++    if (const gl::FramebufferAttachment *readAttachment = source->getReadColorAttachment())
++    {
++        if (readAttachment->isAttached() && readAttachment->type() == GL_TEXTURE)
++        {
++            if (gl::Texture *srcTex = readAttachment->getTexture())
++            {
++                if (egl::Surface *srcSurf = srcTex->getBoundSurface())
++                {
++                    if (GetImplAs<SurfaceGL>(srcSurf)->syncFromNativeSurfaceIfNeeded(context))
++                    {
++                        anySynced = true;
++                    }
++                }
++            }
++        }
++    }
++
++    if (mBoundSurface != nullptr)
++    {
++        SurfaceGL *dstSurf = GetImplAs<SurfaceGL>(mBoundSurface);
++        if (dstSurf->syncFromNativeSurfaceIfNeeded(context))
++        {
++            anySynced = true;
++        }
++        dstSurf->markDirtyForNativeWriteBack();
++    }
++
++    if (anySynced)
++    {
++        ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                          gl::state::DirtyBits().set(),
++                                          gl::state::ExtendedDirtyBits(),
++                                          gl::state::ExtendedDirtyBits().set()));
++    }
++
+     gl::TextureTarget target                 = index.getTarget();
+     size_t level                             = static_cast<size_t>(index.getLevelIndex());
+     const FramebufferGL *sourceFramebufferGL = GetImplAs<FramebufferGL>(source);
+@@ -2994,9 +3044,40 @@ angle::Result TextureGL::copySubTextureHelper(const gl::Context *context,
+ {
+     ContextGL *contextGL              = GetImplAs<ContextGL>(context);
+     const FunctionsGL *functions      = GetFunctionsGL(context);
++    StateManagerGL *stateManager      = GetStateManagerGL(context);
+     const angle::FeaturesGL &features = GetFeaturesGL(context);
+     BlitGL *blitter                   = GetBlitGL(context);
+ 
++    bool anySynced = false;
++    if (source != nullptr)
++    {
++        if (egl::Surface *srcSurf = source->getBoundSurface())
++        {
++            if (GetImplAs<SurfaceGL>(srcSurf)->syncFromNativeSurfaceIfNeeded(context))
++            {
++                anySynced = true;
++            }
++        }
++    }
++
++    if (mBoundSurface != nullptr)
++    {
++        SurfaceGL *dstSurf = GetImplAs<SurfaceGL>(mBoundSurface);
++        if (dstSurf->syncFromNativeSurfaceIfNeeded(context))
++        {
++            anySynced = true;
++        }
++        dstSurf->markDirtyForNativeWriteBack();
++    }
++
++    if (anySynced)
++    {
++        ANGLE_TRY(stateManager->syncState(context, gl::state::DirtyBits(),
++                                          gl::state::DirtyBits().set(),
++                                          gl::state::ExtendedDirtyBits(),
++                                          gl::state::ExtendedDirtyBits().set()));
++    }
++
+     TextureGL *sourceGL = GetImplAs<TextureGL>(source);
+     const gl::ImageDesc &sourceImageDesc =
+         sourceGL->mState.getImageDesc(NonCubeTextureTypeToTarget(source->getType()), sourceLevel);
+@@ -3854,6 +3935,11 @@ angle::Result TextureGL::clearImage(const gl::Context *context,
+     // Some drivers may use color mask state when clearing textures.
+     contextGL->getStateManager()->setColorMask(true, true, true, true);
+ 
++    if (mBoundSurface != nullptr)
++    {
++        GetImplAs<SurfaceGL>(mBoundSurface)->markDirtyForNativeWriteBack();
++    }
++
+     if (mVirtualMipChain.has_value() && getType() == gl::TextureType::CubeMap)
+     {
+         for (gl::TextureTarget face : gl::AllCubeFaceTextureTargets())
+@@ -3903,6 +3989,19 @@ angle::Result TextureGL::clearSubImage(const gl::Context *context,
+     // Some drivers may use color mask state when clearing textures.
+     contextGL->getStateManager()->setColorMask(true, true, true, true);
+ 
++    if (mBoundSurface != nullptr)
++    {
++        SurfaceGL *dstSurf = GetImplAs<SurfaceGL>(mBoundSurface);
++        if (dstSurf->syncFromNativeSurfaceIfNeeded(context))
++        {
++            ANGLE_TRY(contextGL->getStateManager()->syncState(
++                context, gl::state::DirtyBits(), gl::state::DirtyBits().set(),
++                gl::state::ExtendedDirtyBits(), gl::state::ExtendedDirtyBits().set()));
++            contextGL->getStateManager()->setColorMask(true, true, true, true);
++        }
++        dstSurf->markDirtyForNativeWriteBack();
++    }
++
+     nativegl::TexSubImageFormat texSubImageFormat =
+         nativegl::GetTexSubImageFormat(functions, features, format, type);
+     if (mVirtualMipChain.has_value() && getType() == gl::TextureType::CubeMap)
+@@ -3961,6 +4060,8 @@ angle::Result TextureGL::bindTexImage(const gl::Context *context, egl::Surface *
+     stateManager->bindTexture(getType(), mTextureID);
+ 
+     SurfaceGL *surfaceGL = GetImplAs<SurfaceGL>(surface);
++    mBoundSurface        = surface;
++    ANGLE_TRY(surfaceGL->postBindTexImage(context, mTextureID));
+ 
+     const gl::Format &surfaceFormat = surface->getBindTexImageFormat();
+     setLevelInfo(context, getType(), 0, 1,
+@@ -3985,6 +4086,11 @@ angle::Result TextureGL::bindTexImage(const gl::Context *context, egl::Surface *
+ 
+ angle::Result TextureGL::releaseTexImage(const gl::Context *context)
+ {
++    if (mBoundSurface != nullptr)
++    {
++        GetImplAs<SurfaceGL>(mBoundSurface)->onTextureReleased(context);
++        mBoundSurface = nullptr;
++    }
+     ANGLE_TRY(recreateTexture(context));
+     return angle::Result::Continue;
+ }
+diff --git a/src/libANGLE/renderer/gl/TextureGL.h b/src/libANGLE/renderer/gl/TextureGL.h
+index 771f1d4..a8e1308 100644
+--- a/src/libANGLE/renderer/gl/TextureGL.h
++++ b/src/libANGLE/renderer/gl/TextureGL.h
+@@ -492,6 +492,7 @@ class TextureGL : public TextureImpl
+     GLenum mAppliedDepthStencilTextureMode;
+ 
+     GLuint mTextureID;
++    egl::Surface *mBoundSurface = nullptr;
+ };
+ }  // namespace rx
+ 
+diff --git a/src/libANGLE/renderer/gl/cgl/ContextCGL.cpp b/src/libANGLE/renderer/gl/cgl/ContextCGL.cpp
+index bdf5597..554bdd8 100644
+--- a/src/libANGLE/renderer/gl/cgl/ContextCGL.cpp
++++ b/src/libANGLE/renderer/gl/cgl/ContextCGL.cpp
+@@ -22,6 +22,7 @@ ContextCGL::ContextCGL(DisplayCGL *display,
+                        const std::shared_ptr<RendererGL> &renderer,
+                        bool usesDiscreteGPU)
+     : ContextGL(state, errorSet, renderer, RobustnessVideoMemoryPurgeStatus::NOT_REQUESTED),
++      mDisplay(display),
+       mUsesDiscreteGpu(usesDiscreteGPU),
+       mReleasedDiscreteGpu(false)
+ {
+@@ -31,6 +32,26 @@ ContextCGL::ContextCGL(DisplayCGL *display,
+     }
+ }
+ 
++void ContextCGL::flushDirtyNativeSurfaces(const gl::Context *context)
++{
++    if (mDisplay != nullptr)
++    {
++        mDisplay->flushDirtyIOSurfaces(context);
++    }
++}
++
++angle::Result ContextCGL::flush(const gl::Context *context)
++{
++    flushDirtyNativeSurfaces(context);
++    return ContextGL::flush(context);
++}
++
++angle::Result ContextCGL::finish(const gl::Context *context)
++{
++    flushDirtyNativeSurfaces(context);
++    return ContextGL::finish(context);
++}
++
+ egl::Error ContextCGL::releaseHighPowerGPU(gl::Context *context)
+ {
+     if (mUsesDiscreteGpu && !mReleasedDiscreteGpu)
+diff --git a/src/libANGLE/renderer/gl/cgl/ContextCGL.h b/src/libANGLE/renderer/gl/cgl/ContextCGL.h
+index fc27b3a..c3afe50 100644
+--- a/src/libANGLE/renderer/gl/cgl/ContextCGL.h
++++ b/src/libANGLE/renderer/gl/cgl/ContextCGL.h
+@@ -28,10 +28,15 @@ class ContextCGL : public ContextGL
+ 
+     void onDestroy(const gl::Context *context) override;
+ 
++    angle::Result flush(const gl::Context *context) override;
++    angle::Result finish(const gl::Context *context) override;
++    void flushDirtyNativeSurfaces(const gl::Context *context) override;
++
+     egl::Error releaseHighPowerGPU(gl::Context *context) override;
+     egl::Error reacquireHighPowerGPU(gl::Context *context) override;
+ 
+   private:
++    DisplayCGL *mDisplay;
+     bool mUsesDiscreteGpu;
+     bool mReleasedDiscreteGpu;
+ };
+diff --git a/src/libANGLE/renderer/gl/cgl/DisplayCGL.h b/src/libANGLE/renderer/gl/cgl/DisplayCGL.h
+index 2a68888..d86924d 100644
+--- a/src/libANGLE/renderer/gl/cgl/DisplayCGL.h
++++ b/src/libANGLE/renderer/gl/cgl/DisplayCGL.h
+@@ -9,6 +9,7 @@
+ #ifndef LIBANGLE_RENDERER_GL_CGL_DISPLAYCGL_H_
+ #define LIBANGLE_RENDERER_GL_CGL_DISPLAYCGL_H_
+ 
++#include <unordered_map>
+ #include <unordered_set>
+ 
+ #include "libANGLE/renderer/gl/DisplayGL.h"
+@@ -22,6 +23,8 @@ typedef _CGLPixelFormatObject *CGLPixelFormatObj;
+ namespace rx
+ {
+ 
++class IOSurfaceSurfaceCGL;
++
+ struct EnsureCGLContextIsCurrent : angle::NonCopyable
+ {
+   public:
+@@ -100,6 +103,16 @@ class DisplayCGL : public DisplayGL, public ThreadSafeDisplayGL
+ 
+     ThreadSafeDisplayImpl *getThreadSafeDisplayImpl() override { return this; }
+ 
++    void getIOSurfaceBlitFBOs(GLuint *readFBOOut, GLuint *writeFBOOut);
++    void markIOSurfaceDirty(IOSurfaceSurfaceCGL *surface);
++    void unregisterIOSurface(IOSurfaceSurfaceCGL *surface);
++    void flushDirtyIOSurfaces(const gl::Context *context);
++    void flushDirtyIOSurfaceByKey(const gl::Context *context,
++                                  uint64_t ioSurfaceKey,
++                                  const IOSurfaceSurfaceCGL *exclude);
++    uint64_t getIOSurfaceGeneration(uint64_t ioSurfaceKey) const;
++    uint64_t bumpIOSurfaceGeneration(uint64_t ioSurfaceKey);
++
+   private:
+     egl::Error makeCurrentSurfaceless(gl::Context *context) override;
+ 
+@@ -123,6 +136,11 @@ class DisplayCGL : public DisplayGL, public ThreadSafeDisplayGL
+     // is unref'd for the last time, this is set to the time of that last unref. If it isn't
+     // activated again in 10 seconds, the discrete GPU pixel format is deleted.
+     double mLastDiscreteGPUUnrefTime;
++
++    GLuint mIOSurfaceReadFBO;
++    GLuint mIOSurfaceWriteFBO;
++    std::unordered_set<IOSurfaceSurfaceCGL *> mDirtyIOSurfaces;
++    std::unordered_map<uint64_t, uint64_t> mIOSurfaceGenerations;
+ };
+ 
+ }  // namespace rx
+diff --git a/src/libANGLE/renderer/gl/cgl/DisplayCGL.mm b/src/libANGLE/renderer/gl/cgl/DisplayCGL.mm
+index 7263b69..fd59c2f 100644
+--- a/src/libANGLE/renderer/gl/cgl/DisplayCGL.mm
++++ b/src/libANGLE/renderer/gl/cgl/DisplayCGL.mm
+@@ -18,7 +18,9 @@
+ #import "gpu_info_util/SystemInfo_internal.h"
+ #import "libANGLE/Display.h"
+ #import "libANGLE/Error.h"
++#import "libANGLE/renderer/gl/FunctionsGL.h"
+ #import "libANGLE/renderer/gl/RendererGL.h"
++#import "libANGLE/renderer/gl/StateManagerGL.h"
+ #import "libANGLE/renderer/gl/cgl/ContextCGL.h"
+ #import "libANGLE/renderer/gl/cgl/DeviceCGL.h"
+ #import "libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.h"
+@@ -158,7 +160,9 @@
+       mCurrentGPUID(0),
+       mDiscreteGPUPixelFormat(nullptr),
+       mDiscreteGPURefs(0),
+-      mLastDiscreteGPUUnrefTime(0.0)
++      mLastDiscreteGPUUnrefTime(0.0),
++      mIOSurfaceReadFBO(0),
++      mIOSurfaceWriteFBO(0)
+ {}
+ 
+ DisplayCGL::~DisplayCGL() {}
+@@ -257,6 +261,23 @@
+ {
+     DisplayGL::terminate();
+ 
++    mDirtyIOSurfaces.clear();
++    mIOSurfaceGenerations.clear();
++    if (mRenderer)
++    {
++        StateManagerGL *stateManager = mRenderer->getStateManager();
++        if (mIOSurfaceReadFBO != 0)
++        {
++            stateManager->deleteFramebuffer(mIOSurfaceReadFBO);
++            mIOSurfaceReadFBO = 0;
++        }
++        if (mIOSurfaceWriteFBO != 0)
++        {
++            stateManager->deleteFramebuffer(mIOSurfaceWriteFBO);
++            mIOSurfaceWriteFBO = 0;
++        }
++    }
++
+     mRenderer.reset();
+     if (mPixelFormat != nullptr)
+     {
+@@ -323,7 +344,7 @@
+ {
+     ASSERT(buftype == EGL_IOSURFACE_ANGLE);
+ 
+-    return new IOSurfaceSurfaceCGL(state, getRenderer(), mContext, clientBuffer, attribs);
++    return new IOSurfaceSurfaceCGL(state, this, getRenderer(), mContext, clientBuffer, attribs);
+ }
+ 
+ SurfaceImpl *DisplayCGL::createPixmapSurface(const egl::SurfaceState &state,
+@@ -402,9 +423,9 @@
+     config.samples           = 0;
+     config.level             = 0;
+     config.bindToTextureRGB  = EGL_FALSE;
+-    config.bindToTextureRGBA = EGL_FALSE;
++    config.bindToTextureRGBA = EGL_TRUE;
+ 
+-    config.bindToTextureTarget = EGL_TEXTURE_RECTANGLE_ANGLE;
++    config.bindToTextureTarget = EGL_TEXTURE_2D;
+ 
+     config.surfaceType = EGL_WINDOW_BIT | EGL_PBUFFER_BIT;
+ 
+@@ -493,10 +514,108 @@
+ 
+ egl::Error DisplayCGL::waitUntilWorkScheduled()
+ {
+-    mState.contextMap.forEach([](gl::Context *context) { context->flush(); });
++    EnsureCGLContextIsCurrent ensureCurrent(mContext);
++    if (!mDirtyIOSurfaces.empty())
++    {
++        gl::Context *anyContext = nullptr;
++        mState.contextMap.forEach([&anyContext](gl::Context *context) {
++            if (anyContext == nullptr && context != nullptr)
++            {
++                anyContext = context;
++            }
++        });
++        if (anyContext != nullptr)
++        {
++            flushDirtyIOSurfaces(anyContext);
++        }
++    }
++    mState.contextMap.forEach([](gl::Context *context) {
++        if (context != nullptr)
++        {
++            context->flush();
++        }
++    });
+     return egl::NoError();
+ }
+ 
++void DisplayCGL::getIOSurfaceBlitFBOs(GLuint *readFBOOut, GLuint *writeFBOOut)
++{
++    const FunctionsGL *functions = mRenderer->getFunctions();
++    if (mIOSurfaceReadFBO == 0)
++    {
++        functions->genFramebuffers(1, &mIOSurfaceReadFBO);
++    }
++    if (mIOSurfaceWriteFBO == 0)
++    {
++        functions->genFramebuffers(1, &mIOSurfaceWriteFBO);
++    }
++    *readFBOOut  = mIOSurfaceReadFBO;
++    *writeFBOOut = mIOSurfaceWriteFBO;
++}
++
++void DisplayCGL::markIOSurfaceDirty(IOSurfaceSurfaceCGL *surface)
++{
++    if (surface != nullptr)
++    {
++        mDirtyIOSurfaces.insert(surface);
++    }
++}
++
++void DisplayCGL::unregisterIOSurface(IOSurfaceSurfaceCGL *surface)
++{
++    mDirtyIOSurfaces.erase(surface);
++}
++
++void DisplayCGL::flushDirtyIOSurfaces(const gl::Context *context)
++{
++    if (mDirtyIOSurfaces.empty() || context == nullptr)
++    {
++        return;
++    }
++
++    std::vector<IOSurfaceSurfaceCGL *> dirty(mDirtyIOSurfaces.begin(), mDirtyIOSurfaces.end());
++    mDirtyIOSurfaces.clear();
++    for (IOSurfaceSurfaceCGL *surface : dirty)
++    {
++        surface->syncToNativeSurfaceIfDirty(context);
++    }
++}
++
++void DisplayCGL::flushDirtyIOSurfaceByKey(const gl::Context *context,
++                                          uint64_t ioSurfaceKey,
++                                          const IOSurfaceSurfaceCGL *exclude)
++{
++    if (mDirtyIOSurfaces.empty() || context == nullptr)
++    {
++        return;
++    }
++
++    std::vector<IOSurfaceSurfaceCGL *> matching;
++    for (IOSurfaceSurfaceCGL *surface : mDirtyIOSurfaces)
++    {
++        if (surface != exclude && surface->getIOSurfaceKey() == ioSurfaceKey)
++        {
++            matching.push_back(surface);
++        }
++    }
++    for (IOSurfaceSurfaceCGL *surface : matching)
++    {
++        mDirtyIOSurfaces.erase(surface);
++        surface->syncToNativeSurfaceIfDirty(context);
++    }
++}
++
++uint64_t DisplayCGL::getIOSurfaceGeneration(uint64_t ioSurfaceKey) const
++{
++    auto it = mIOSurfaceGenerations.find(ioSurfaceKey);
++    return (it != mIOSurfaceGenerations.end()) ? it->second : 0;
++}
++
++uint64_t DisplayCGL::bumpIOSurfaceGeneration(uint64_t ioSurfaceKey)
++{
++    return ++mIOSurfaceGenerations[ioSurfaceKey];
++}
++
+ gl::Version DisplayCGL::getMaxSupportedESVersion() const
+ {
+     return mRenderer->getMaxSupportedESVersion();
+diff --git a/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.cpp b/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.cpp
+index d45197c..09c67f2 100644
+--- a/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.cpp
++++ b/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.cpp
+@@ -43,18 +43,21 @@ struct IOSurfaceFormatInfo
+     GLenum nativeInternalFormat;
+     GLenum nativeFormat;
+     GLenum nativeType;
++
++    GLenum tex2DInternalFormat;
+ };
+ 
+ // clang-format off
+-static constexpr std::array<IOSurfaceFormatInfo, 8> kIOSurfaceFormats = {{
+-    {GL_RED,      GL_UNSIGNED_BYTE,                1, GL_RED,  GL_RED,  GL_UNSIGNED_BYTE              },
+-    {GL_RED,      GL_UNSIGNED_SHORT,               2, GL_RED,  GL_RED,  GL_UNSIGNED_SHORT             },
+-    {GL_RG,       GL_UNSIGNED_BYTE,                2, GL_RG,   GL_RG,   GL_UNSIGNED_BYTE              },
+-    {GL_RG,       GL_UNSIGNED_SHORT,               4, GL_RG,   GL_RG,   GL_UNSIGNED_SHORT             },
+-    {GL_RGB,      GL_UNSIGNED_BYTE,                4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV   },
+-    {GL_BGRA_EXT, GL_UNSIGNED_BYTE,                4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV   },
+-    {GL_RGB10_A2, GL_UNSIGNED_INT_2_10_10_10_REV,  4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_2_10_10_10_REV},
+-    {GL_RGBA,     GL_HALF_FLOAT,                   8, GL_RGBA, GL_RGBA, GL_HALF_FLOAT                 },
++static constexpr std::array<IOSurfaceFormatInfo, 9> kIOSurfaceFormats = {{
++    {GL_RED,      GL_UNSIGNED_BYTE,                1, GL_RED,  GL_RED,  GL_UNSIGNED_BYTE,              GL_R8     },
++    {GL_RED,      GL_UNSIGNED_SHORT,               2, GL_RED,  GL_RED,  GL_UNSIGNED_SHORT,             GL_R16    },
++    {GL_RG,       GL_UNSIGNED_BYTE,                2, GL_RG,   GL_RG,   GL_UNSIGNED_BYTE,              GL_RG8    },
++    {GL_RG,       GL_UNSIGNED_SHORT,               4, GL_RG,   GL_RG,   GL_UNSIGNED_SHORT,             GL_RG16   },
++    {GL_RGB,      GL_UNSIGNED_BYTE,                4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,   GL_RGBA8  },
++    {GL_RGBA,     GL_UNSIGNED_BYTE,                4, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE,              GL_RGBA8  },
++    {GL_BGRA_EXT, GL_UNSIGNED_BYTE,                4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,   GL_RGBA8  },
++    {GL_RGB10_A2, GL_UNSIGNED_INT_2_10_10_10_REV,  4, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_2_10_10_10_REV, GL_RGB10_A2},
++    {GL_RGBA,     GL_HALF_FLOAT,                   8, GL_RGBA, GL_RGBA, GL_HALF_FLOAT,                 GL_RGBA16F},
+ }};
+ // clang-format on
+ 
+@@ -74,27 +77,40 @@ int FindIOSurfaceFormatIndex(GLenum internalFormat, GLenum type)
+ }  // anonymous namespace
+ 
+ IOSurfaceSurfaceCGL::IOSurfaceSurfaceCGL(const egl::SurfaceState &state,
++                                         DisplayCGL *display,
+                                          RendererGL *renderer,
+                                          CGLContextObj cglContext,
+                                          EGLClientBuffer buffer,
+                                          const egl::AttributeMap &attribs)
+     : SurfaceGL(state),
++      mDisplay(display),
+       mFunctions(renderer->getFunctions()),
+       mStateManager(renderer->getStateManager()),
+       mCGLContext(cglContext),
+       mIOSurface(nullptr),
++      mIOSurfaceKey(0),
+       mWidth(0),
+       mHeight(0),
+       mPlane(0),
+       mFormatIndex(-1),
+       mAlphaInitialized(false),
+       mTextureID(0),
+-      mFramebufferID(0)
++      mFramebufferID(0),
++      mIOSurfaceTextureID(0),
++      mBoundTextureID(0),
++      mLastSeed(0),
++      mLastGeneration(0),
++      mNeedsWriteBack(false)
+ {
+     // Keep reference to the IOSurface so it doesn't get deleted while the pbuffer exists.
+     mIOSurface = reinterpret_cast<IOSurfaceRef>(buffer);
+     CFRetain(mIOSurface);
+ 
++    uint32_t surfaceID = IOSurfaceGetID(mIOSurface);
++    mIOSurfaceKey      = (surfaceID != 0)
++                             ? static_cast<uint64_t>(surfaceID)
++                             : ((uint64_t(1) << 63) | reinterpret_cast<uintptr_t>(mIOSurface));
++
+     // Extract attribs useful for the call to CGLTexImageIOSurface2D
+     mWidth  = static_cast<int>(attribs.get(EGL_WIDTH));
+     mHeight = static_cast<int>(attribs.get(EGL_HEIGHT));
+@@ -111,6 +127,17 @@ IOSurfaceSurfaceCGL::IOSurfaceSurfaceCGL(const egl::SurfaceState &state,
+ 
+ IOSurfaceSurfaceCGL::~IOSurfaceSurfaceCGL()
+ {
++    if (mDisplay != nullptr)
++    {
++        mDisplay->unregisterIOSurface(this);
++    }
++
++    if (mIOSurfaceTextureID != 0)
++    {
++        mStateManager->deleteTexture(mIOSurfaceTextureID);
++        mIOSurfaceTextureID = 0;
++    }
++
+     if (mFramebufferID != 0)
+     {
+         mStateManager->deleteFramebuffer(mFramebufferID);
+@@ -138,6 +165,7 @@ egl::Error IOSurfaceSurfaceCGL::makeCurrent(const gl::Context *context)
+ 
+ egl::Error IOSurfaceSurfaceCGL::unMakeCurrent(const gl::Context *context)
+ {
++    syncToNativeSurfaceIfDirty(context);
+     GetFunctionsGL(context)->flush();
+     return egl::NoError();
+ }
+@@ -163,43 +191,257 @@ egl::Error IOSurfaceSurfaceCGL::querySurfacePointerANGLE(EGLint attribute, void
+     return egl::NoError();
+ }
+ 
++egl::Error IOSurfaceSurfaceCGL::bindIOSurfaceToRectTexture(const gl::Context *context,
++                                                           GLuint rectTextureID)
++{
++    StateManagerGL *stateManager = GetStateManagerGL(context);
++    const FunctionsGL *functions = GetFunctionsGL(context);
++
++    stateManager->bindTexture(gl::TextureType::Rectangle, rectTextureID);
++    functions->texParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    functions->texParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    functions->texParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    functions->texParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++    const auto &format  = kIOSurfaceFormats[mFormatIndex];
++    GLenum nativeFormat = format.nativeFormat;
++    GLenum nativeType   = format.nativeType;
++
++    if (format.internalFormat == GL_RGB || format.internalFormat == GL_RGBA)
++    {
++        OSType pixelFormat = IOSurfaceGetPixelFormat(mIOSurface);
++        if (pixelFormat == 'RGBA')
++        {
++            nativeFormat = GL_RGBA;
++            nativeType   = GL_UNSIGNED_BYTE;
++        }
++        else if (pixelFormat == 'BGRA')
++        {
++            nativeFormat = GL_BGRA;
++            nativeType   = GL_UNSIGNED_INT_8_8_8_8_REV;
++        }
++    }
++
++    CGLError error = CGLTexImageIOSurface2D(mCGLContext, GL_TEXTURE_RECTANGLE,
++                                            format.nativeInternalFormat, mWidth, mHeight,
++                                            nativeFormat, nativeType, mIOSurface, mPlane);
++    if (error != kCGLNoError)
++    {
++        std::ostringstream err;
++        err << "CGLTexImageIOSurface2D failed: " << CGLErrorString(error);
++        return egl::Error(EGL_CONTEXT_LOST, err.str());
++    }
++    return egl::NoError();
++}
++
++void IOSurfaceSurfaceCGL::blitBetweenTextures(const gl::Context *context, bool rectTo2D)
++{
++    const FunctionsGL *functions = GetFunctionsGL(context);
++    StateManagerGL *stateManager = GetStateManagerGL(context);
++
++    GLuint readFBO  = 0;
++    GLuint writeFBO = 0;
++    mDisplay->getIOSurfaceBlitFBOs(&readFBO, &writeFBO);
++
++    stateManager->setScissorTestEnabled(false);
++    stateManager->setColorMask(true, true, true, true);
++    stateManager->setFramebufferSRGBEnabled(context, false);
++
++    stateManager->bindFramebuffer(GL_READ_FRAMEBUFFER, readFBO);
++    stateManager->bindFramebuffer(GL_DRAW_FRAMEBUFFER, writeFBO);
++
++    const GLenum srcTarget = rectTo2D ? GL_TEXTURE_RECTANGLE : GL_TEXTURE_2D;
++    const GLenum dstTarget = rectTo2D ? GL_TEXTURE_2D : GL_TEXTURE_RECTANGLE;
++    const GLuint srcTex    = rectTo2D ? mIOSurfaceTextureID : mBoundTextureID;
++    const GLuint dstTex    = rectTo2D ? mBoundTextureID : mIOSurfaceTextureID;
++
++    functions->framebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, srcTarget, srcTex,
++                                    0);
++    functions->framebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dstTarget, dstTex,
++                                    0);
++
++    functions->blitFramebuffer(0, 0, mWidth, mHeight, 0, 0, mWidth, mHeight, GL_COLOR_BUFFER_BIT,
++                               GL_NEAREST);
++
++    functions->framebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, srcTarget, 0, 0);
++    functions->framebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dstTarget, 0, 0);
++}
++
+ egl::Error IOSurfaceSurfaceCGL::bindTexImage(const gl::Context *context,
+                                              gl::Texture *texture,
+                                              EGLint buffer)
+ {
+     StateManagerGL *stateManager = GetStateManagerGL(context);
++    const FunctionsGL *functions = GetFunctionsGL(context);
+ 
+     const TextureGL *textureGL = GetImplAs<TextureGL>(texture);
+     GLuint textureID           = textureGL->getTextureID();
+-    stateManager->bindTexture(gl::TextureType::Rectangle, textureID);
+ 
+-    const auto &format = kIOSurfaceFormats[mFormatIndex];
+-    CGLError error     = CGLTexImageIOSurface2D(
+-        mCGLContext, GL_TEXTURE_RECTANGLE, format.nativeInternalFormat, mWidth, mHeight,
+-        format.nativeFormat, format.nativeType, mIOSurface, mPlane);
++    if (texture->getType() == gl::TextureType::Rectangle)
++    {
++        ANGLE_TRY(bindIOSurfaceToRectTexture(context, textureID));
+ 
+-    if (error != kCGLNoError)
++        if (IsError(initializeAlphaChannel(context, textureID)))
++        {
++            return egl::Error(EGL_CONTEXT_LOST, "Failed to initialize IOSurface alpha channel.");
++        }
++
++        mBoundTextureID = 0;
++        mNeedsWriteBack = false;
++        return egl::NoError();
++    }
++
++    // GL_TEXTURE_2D bridge: bind IOSurface to an internal GL_TEXTURE_RECTANGLE and GPU-blit
++    // into the bound GL_TEXTURE_2D texture so Chromium M158+ shaders sample standard sampler2D
++    // with normalized [0..1] UVs.
++    if (mDisplay != nullptr)
+     {
+-        std::ostringstream err;
+-        err << "CGLTexImageIOSurface2D failed: " << CGLErrorString(error);
+-        return egl::Error(EGL_CONTEXT_LOST, err.str());
++        mDisplay->flushDirtyIOSurfaceByKey(context, mIOSurfaceKey, this);
+     }
+ 
+-    if (IsError(initializeAlphaChannel(context, textureID)))
++    if (mIOSurfaceTextureID == 0)
++    {
++        functions->genTextures(1, &mIOSurfaceTextureID);
++    }
++
++    ANGLE_TRY(bindIOSurfaceToRectTexture(context, mIOSurfaceTextureID));
++
++    if (IsError(initializeAlphaChannel(context, mIOSurfaceTextureID)))
+     {
+         return egl::Error(EGL_CONTEXT_LOST, "Failed to initialize IOSurface alpha channel.");
+     }
+ 
++    const auto &format = kIOSurfaceFormats[mFormatIndex];
++    stateManager->bindBuffer(gl::BufferBinding::PixelUnpack, 0, context->isHardenedContext());
++    stateManager->bindTexture(gl::TextureType::_2D, textureID);
++    functions->texImage2D(GL_TEXTURE_2D, 0, format.tex2DInternalFormat, mWidth, mHeight, 0,
++                          format.nativeFormat, format.nativeType, nullptr);
++
++    mBoundTextureID = textureID;
++    mNeedsWriteBack = false;
++    mLastSeed       = IOSurfaceGetSeed(mIOSurface);
++    mLastGeneration = (mDisplay != nullptr) ? mDisplay->getIOSurfaceGeneration(mIOSurfaceKey) : 0;
++
++    blitBetweenTextures(context, /*rectTo2D=*/true);
++
++    // Leave the 2D texture bound for TextureGL::bindTexImage().
++    stateManager->bindTexture(gl::TextureType::_2D, textureID);
++
+     return egl::NoError();
+ }
+ 
++angle::Result IOSurfaceSurfaceCGL::postBindTexImage(const gl::Context *context, GLuint textureID)
++{
++    if (mBoundTextureID == 0 || mBoundTextureID == textureID || mIOSurfaceTextureID == 0)
++    {
++        return angle::Result::Continue;
++    }
++
++    // TextureGL::releaseTexImage from a previously bound surface recreated the GL texture ID
++    // after our bindTexImage() ran; re-allocate and populate the new 2D texture ID.
++    StateManagerGL *stateManager = GetStateManagerGL(context);
++    const FunctionsGL *functions = GetFunctionsGL(context);
++    const auto &format           = kIOSurfaceFormats[mFormatIndex];
++
++    stateManager->bindBuffer(gl::BufferBinding::PixelUnpack, 0, context->isHardenedContext());
++    stateManager->bindTexture(gl::TextureType::_2D, textureID);
++    functions->texImage2D(GL_TEXTURE_2D, 0, format.tex2DInternalFormat, mWidth, mHeight, 0,
++                          format.nativeFormat, format.nativeType, nullptr);
++
++    mBoundTextureID = textureID;
++    mNeedsWriteBack = false;
++    mLastSeed       = IOSurfaceGetSeed(mIOSurface);
++    mLastGeneration = (mDisplay != nullptr) ? mDisplay->getIOSurfaceGeneration(mIOSurfaceKey) : 0;
++
++    blitBetweenTextures(context, /*rectTo2D=*/true);
++    stateManager->bindTexture(gl::TextureType::_2D, textureID);
++    return angle::Result::Continue;
++}
++
++void IOSurfaceSurfaceCGL::onTextureReleased(const gl::Context *context)
++{
++    syncToNativeSurfaceIfDirty(context);
++    if (mDisplay != nullptr)
++    {
++        mDisplay->unregisterIOSurface(this);
++    }
++    mBoundTextureID = 0;
++}
++
+ egl::Error IOSurfaceSurfaceCGL::releaseTexImage(const gl::Context *context, EGLint buffer)
+ {
++    onTextureReleased(context);
++
+     const FunctionsGL *functions = GetFunctionsGL(context);
+     functions->flush();
+     return egl::NoError();
+ }
+ 
++bool IOSurfaceSurfaceCGL::syncFromNativeSurfaceIfNeeded(const gl::Context *context)
++{
++    if (mBoundTextureID == 0 || mIOSurfaceTextureID == 0 || mIOSurface == nullptr)
++    {
++        return false;
++    }
++
++    // Never overwrite uncommitted GPU writes in mBoundTextureID with stale IOSurface pixels.
++    if (mNeedsWriteBack)
++    {
++        return false;
++    }
++
++    if (mDisplay != nullptr)
++    {
++        mDisplay->flushDirtyIOSurfaceByKey(context, mIOSurfaceKey, this);
++    }
++
++    uint32_t currentSeed = IOSurfaceGetSeed(mIOSurface);
++    uint64_t currentGen =
++        (mDisplay != nullptr) ? mDisplay->getIOSurfaceGeneration(mIOSurfaceKey) : 0;
++    if (currentSeed == mLastSeed && currentGen == mLastGeneration)
++    {
++        return false;
++    }
++
++    if (bindIOSurfaceToRectTexture(context, mIOSurfaceTextureID).isError())
++    {
++        return false;
++    }
++
++    blitBetweenTextures(context, /*rectTo2D=*/true);
++    mLastSeed       = currentSeed;
++    mLastGeneration = currentGen;
++    return true;
++}
++
++void IOSurfaceSurfaceCGL::markDirtyForNativeWriteBack()
++{
++    if (mBoundTextureID != 0 && mIOSurfaceTextureID != 0 && !mNeedsWriteBack)
++    {
++        mNeedsWriteBack = true;
++        if (mDisplay != nullptr)
++        {
++            mDisplay->markIOSurfaceDirty(this);
++        }
++    }
++}
++
++void IOSurfaceSurfaceCGL::syncToNativeSurfaceIfDirty(const gl::Context *context)
++{
++    if (!mNeedsWriteBack || mBoundTextureID == 0 || mIOSurfaceTextureID == 0 ||
++        mIOSurface == nullptr)
++    {
++        mNeedsWriteBack = false;
++        return;
++    }
++
++    mNeedsWriteBack = false;
++    blitBetweenTextures(context, /*rectTo2D=*/false);
++    mLastGeneration =
++        (mDisplay != nullptr) ? mDisplay->bumpIOSurfaceGeneration(mIOSurfaceKey) : mLastGeneration;
++    mLastSeed = IOSurfaceGetSeed(mIOSurface);
++}
++
+ void IOSurfaceSurfaceCGL::setSwapInterval(const egl::ThreadSafeDisplay *display, EGLint interval)
+ {
+     UNREACHABLE();
+diff --git a/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.h b/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.h
+index 8bca535..18556f8 100644
+--- a/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.h
++++ b/src/libANGLE/renderer/gl/cgl/IOSurfaceSurfaceCGL.h
+@@ -32,6 +32,7 @@ class IOSurfaceSurfaceCGL : public SurfaceGL
+ {
+   public:
+     IOSurfaceSurfaceCGL(const egl::SurfaceState &state,
++                        DisplayCGL *display,
+                         RendererGL *renderer,
+                         CGLContextObj cglContext,
+                         EGLClientBuffer buffer,
+@@ -67,16 +68,28 @@ class IOSurfaceSurfaceCGL : public SurfaceGL
+     void attachToFramebuffer(const gl::Context *context, gl::Framebuffer *framebuffer) override;
+     void detachFromFramebuffer(gl::Framebuffer *framebuffer) override;
+ 
++    bool syncFromNativeSurfaceIfNeeded(const gl::Context *context) override;
++    void markDirtyForNativeWriteBack() override;
++    void syncToNativeSurfaceIfDirty(const gl::Context *context) override;
++    angle::Result postBindTexImage(const gl::Context *context, GLuint textureID) override;
++    void onTextureReleased(const gl::Context *context) override;
++
++    uint64_t getIOSurfaceKey() const { return mIOSurfaceKey; }
++
+   private:
+     angle::Result initializeAlphaChannel(const gl::Context *context, GLuint texture);
++    egl::Error bindIOSurfaceToRectTexture(const gl::Context *context, GLuint rectTextureID);
++    void blitBetweenTextures(const gl::Context *context, bool rectTo2D);
+ 
+     // TODO(geofflang): Don't store these, they are potentially specific to a single GL context.
+     // http://anglebug.com/40096492
++    DisplayCGL *mDisplay;
+     const FunctionsGL *mFunctions;
+     StateManagerGL *mStateManager;
+ 
+     CGLContextObj mCGLContext;
+     IOSurfaceRef mIOSurface;
++    uint64_t mIOSurfaceKey;
+     int mWidth;
+     int mHeight;
+     int mPlane;
+@@ -86,6 +99,13 @@ class IOSurfaceSurfaceCGL : public SurfaceGL
+ 
+     GLuint mTextureID;
+     GLuint mFramebufferID;
++
++    // Bridge state for GL_TEXTURE_2D <-> internal GL_TEXTURE_RECTANGLE IOSurface binding.
++    GLuint mIOSurfaceTextureID;
++    GLuint mBoundTextureID;
++    uint32_t mLastSeed;
++    uint64_t mLastGeneration;
++    bool mNeedsWriteBack;
+ };
+ 
+ }  // namespace rx
