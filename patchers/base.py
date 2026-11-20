@@ -757,29 +757,33 @@ class BaseBrowserPatcher:
         The probe covers WebGL/WebGL2, WebGPU, 2D canvas availability, media
         capability queries for common codecs, and capture API availability.
         It uses an isolated temporary profile so it does not touch the user's
-        browser session.
+        browser session, and streams Base64-encoded JSON over console logging
+        so headless macOS builds where --dump-dom stalls on virtual VSync
+        still return in ~1-2 seconds.
         """
         launcher_dst = self.get_launcher_dst()
         if not os.path.exists(launcher_dst):
             return "", {}, f"Executable not found at {launcher_dst}"
 
         import base64
-        import html
         import json
         import re
+        import select
         import shutil
         import subprocess
         import tempfile
 
         probe_html = """<!DOCTYPE html><html><body>
-<div id="gpu_result">WAITING</div>
-<div id="features">{}</div>
 <script>
 (function () {
   const out = {};
-  function publish() {
-    document.getElementById('gpu_result').textContent = out.renderer || 'UNKNOWN';
-    document.getElementById('features').textContent = JSON.stringify(out);
+  function emit(tag) {
+    try {
+      const payload = btoa(unescape(encodeURIComponent(JSON.stringify(out))));
+      console.log(tag + ':' + payload);
+    } catch (e) {
+      console.log(tag + '_ERR:' + String(e));
+    }
   }
 
   try {
@@ -805,118 +809,190 @@ class BaseBrowserPatcher:
     out.canvas2d = false;
   }
 
-  /* Publish the synchronous results immediately. Async probes may be slow or
-     unavailable in headless mode and must not leave the page at WAITING. */
-  publish();
+  try {
+    out.userMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    out.displayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  } catch (e) {}
+
+  emit('GPU_PROBE_PARTIAL');
 
   (async function () {
-    try {
-      out.webgpu = !!navigator.gpu;
-      if (navigator.gpu) {
-        const adapter = await Promise.race([
-          navigator.gpu.requestAdapter(),
-          new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 2000); })
-        ]);
-        out.webgpuAdapter = !!adapter;
-        if (adapter && adapter.info) {
-          out.webgpuInfo = {
-            vendor: adapter.info.vendor,
-            architecture: adapter.info.architecture,
-            device: adapter.info.device,
-            description: adapter.info.description
-          };
-        }
-      }
-    } catch (e) {
-      out.webgpu = false;
-      out.webgpuError = String(e);
-    }
-    publish();
-
-    try {
-      out.userMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-      out.displayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-    } catch (e) {}
-
-    out.media = {};
-    const codecs = {
-      h264: 'video/mp4; codecs="avc1.42E01E"',
-      vp9: 'video/mp4; codecs="vp09.00.10.08"',
-      av1: 'video/mp4; codecs="av01.0.04M.08"',
-      hevc: 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+    const withTimeout = function (promise, ms, fallback) {
+      return Promise.race([
+        promise,
+        new Promise(function (resolve) { setTimeout(function () { resolve(fallback); }, ms); })
+      ]);
     };
-    if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
-      for (const name of Object.keys(codecs)) {
-        try {
-          out.media[name] = await Promise.race([
-            navigator.mediaCapabilities.decodingInfo({
-              type: 'file',
-              video: {
-                contentType: codecs[name],
-                width: 1920,
-                height: 1080,
-                bitrate: 4000000,
-                framerate: 30
-              }
-            }),
-            new Promise(function (resolve) { setTimeout(function () { resolve({ error: 'timeout' }); }, 2000); })
-          ]);
-        } catch (e) {
-          out.media[name] = { error: String(e) };
+
+    const webgpuTask = (async function () {
+      try {
+        out.webgpu = !!navigator.gpu;
+        if (navigator.gpu) {
+          const adapter = await withTimeout(navigator.gpu.requestAdapter(), 1500, null);
+          out.webgpuAdapter = !!adapter;
+          if (adapter && adapter.info) {
+            out.webgpuInfo = {
+              vendor: adapter.info.vendor,
+              architecture: adapter.info.architecture,
+              device: adapter.info.device,
+              description: adapter.info.description
+            };
+          }
         }
+      } catch (e) {
+        out.webgpu = false;
+        out.webgpuError = String(e);
       }
-    } else {
-      out.mediaError = 'mediaCapabilities unavailable';
-    }
-    publish();
+    })();
+
+    const mediaTask = (async function () {
+      out.media = {};
+      const codecs = {
+        h264: 'video/mp4; codecs="avc1.42E01E"',
+        vp9: 'video/mp4; codecs="vp09.00.10.08"',
+        av1: 'video/mp4; codecs="av01.0.04M.08"',
+        hevc: 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+      };
+      if (navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo) {
+        await Promise.all(Object.keys(codecs).map(async function (name) {
+          try {
+            out.media[name] = await withTimeout(
+              navigator.mediaCapabilities.decodingInfo({
+                type: 'file',
+                video: {
+                  contentType: codecs[name],
+                  width: 1920,
+                  height: 1080,
+                  bitrate: 4000000,
+                  framerate: 30
+                }
+              }),
+              1500,
+              { error: 'timeout' }
+            );
+          } catch (e) {
+            out.media[name] = { error: String(e) };
+          }
+        }));
+      } else {
+        out.mediaError = 'mediaCapabilities unavailable';
+      }
+    })();
+
+    await Promise.all([webgpuTask, mediaTask]);
+    emit('GPU_PROBE_DONE');
   })();
 })();
 </script>
 </body></html>"""
 
-        b64 = base64.b64encode(probe_html.encode("utf-8")).decode("ascii")
-        data_uri = f"data:text/html;base64,{b64}"
-
         # Chrome, Brave, and Helium support --headless=new; Opera works best with --headless
         flag_headless = "--headless" if self.slug == "opera" else "--headless=new"
         tmpdir = tempfile.mkdtemp(prefix="chrome-gpu-probe-")
+        probe_file = os.path.join(tmpdir, "probe.html")
+        user_data_dir = os.path.join(tmpdir, "profile")
+        with open(probe_file, "w", encoding="utf-8") as f:
+            f.write(probe_html)
+
         cmd = [
             launcher_dst,
             flag_headless,
+            "--use-mock-keychain",
             "--no-first-run",
             "--no-default-browser-check",
-            f"--user-data-dir={tmpdir}",
-            "--virtual-time-budget=8000",
-            "--run-all-compositor-stages-before-draw",
-            "--dump-dom",
-            data_uri,
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--mute-audio",
+            "--enable-logging=stderr",
+            "--log-level=0",
+            f"--user-data-dir={user_data_dir}",
+            f"file://{probe_file}",
         ]
 
+        def _decode_tag(line, tag):
+            m = re.search(rf"{tag}:([A-Za-z0-9+/=]+)", line)
+            if not m:
+                return None
+            try:
+                return json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
+            except Exception:
+                return None
+
+        proc = None
+        features = {}
+        done = False
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            features = {}
-            m = re.search(r'<div id="features">(.*?)</div>', res.stdout, re.DOTALL)
-            if m:
-                raw = html.unescape(m.group(1)).strip()
-                try:
-                    features = json.loads(raw)
-                except Exception:
-                    features = {"raw": raw}
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            deadline = time.monotonic() + 15.0
+            fd = proc.stderr.fileno()
+            buf = ""
+            while time.monotonic() < deadline:
+                remaining = max(0.05, deadline - time.monotonic())
+                ready, _, _ = select.select([fd], [], [], min(0.5, remaining))
+                if ready:
+                    chunk = os.read(fd, 8192).decode("utf-8", errors="ignore")
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        parsed_done = _decode_tag(line, "GPU_PROBE_DONE")
+                        if parsed_done is not None:
+                            features = parsed_done
+                            done = True
+                            break
+                        parsed_partial = _decode_tag(line, "GPU_PROBE_PARTIAL")
+                        if parsed_partial is not None:
+                            features = parsed_partial
+                    if done:
+                        break
+                elif proc.poll() is not None:
+                    break
+
+            if not done and buf:
+                parsed_done = _decode_tag(buf, "GPU_PROBE_DONE")
+                if parsed_done is not None:
+                    features = parsed_done
+                    done = True
+                elif not features:
+                    parsed_partial = _decode_tag(buf, "GPU_PROBE_PARTIAL")
+                    if parsed_partial is not None:
+                        features = parsed_partial
 
             renderer = str(features.get("renderer", "")).strip()
-            if not renderer:
-                g = re.search(r'<div id="gpu_result">(.*?)</div>', res.stdout, re.DOTALL)
-                if g:
-                    renderer = html.unescape(g.group(1)).strip()
-
             if not features and not renderer:
+                if proc.poll() is None:
+                    return "", {}, "Process timed out during GPU/feature probe"
                 return "", {}, "Could not parse probe output"
             return renderer, features, None
-        except subprocess.TimeoutExpired:
-            return "", {}, "Process timed out during GPU/feature probe"
         except Exception as e:
             return "", {}, str(e)
         finally:
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def probe_gpu_status(self):
