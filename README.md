@@ -109,45 +109,47 @@ python3 patch.py helium
 | `python3 patch.py --restore helium` | Restores original unpatched Helium Browser from backup. |
 | `python3 patch.py --restore thorium` | Restores original unpatched Thorium Browser from backup. |
 
-#### 🔎 CLI Flags (`--force`, `--check`, `--diagnose`), V2 Launcher & Brave `angle_dylibs_tex2d/`
+#### 🔎 CLI Flags (`--force`, `--check`, `--diagnose`), V2 Launcher & `angle_dylibs_tex2d/`
 
 ##### Key Patcher Commands
-- **`--check`**: Read-only check verifying that the target browser's launcher, ANGLE dylibs, required binary patches, and `LocalCodeSigner` code signature are in place (`python3 patch.py brave --check` or `python3 patch.py --check all`).
-- **`--force`**: Forces re-patching even when `--check` reports the browser is already patched — useful after updating this repo, rebuilding `angle_dylibs_tex2d/`, or changing the compiled-in default profile (e.g. `python3 patch.py brave --profile compat --force`). It resets the framework binary from the clean backup before re-applying patches.
-- **`--diagnose`**: Read-only end-to-end health check (`python3 patch.py brave --diagnose`). Prints:
+- **`--check`**: Read-only check verifying that the target browser's launcher, ANGLE dylibs, required binary patches, and `LocalCodeSigner` code signature are in place (`python3 patch.py chrome --check`, `python3 patch.py brave --check`, or `python3 patch.py --check all`).
+- **`--force`**: Forces re-patching even when `--check` reports the browser is already patched — useful after updating this repo, rebuilding `angle_dylibs_tex2d/`, or changing the compiled-in default profile (e.g. `python3 patch.py chrome --profile compat --force`). It resets the framework binary from the clean backup before re-applying patches.
+- **`--diagnose`**: Read-only end-to-end health check (`python3 patch.py chrome --diagnose` or `python3 patch.py brave --diagnose`). Prints:
   1. The V2 launcher's compiled default profile, dynamic ANGLE status, and embedded flags.
   2. A binary pattern dry-run against the installed framework (showing applied vs. skipped patches).
   3. A live headless feature probe reporting the active ANGLE/GPU renderer, WebGL/2D Canvas/WebGPU status, camera/screen-capture API availability, and hardware vs. software decode for H.264, HEVC, VP9, and AV1.
 
-##### Brave Browser Default Mode (`angle_dylibs_tex2d/` + Patches 1–4)
-- **What `angle_dylibs_tex2d/` does:** Stock macOS ANGLE CGL only binds `IOSurface` buffers to `GL_TEXTURE_RECTANGLE` (`0x84f5`), which breaks Chromium M158+ `sampler2D` shaders (`GL_TEXTURE_2D`, `0x0de1`) for VideoToolbox decode, GMB video frames, webcam/ScreenCaptureKit, and Zero-Copy tiles. `angle_dylibs_tex2d/` contains a custom-built ANGLE CGL (`libEGL.dylib` + `libGLESv2.dylib`, reproducible from `patches/angle_cgl_iosurface_tex2d.patch`) that natively advertises `EGL_TEXTURE_2D` (`0x305f`) and bridges `GL_TEXTURE_2D` ↔ `IOSurface` via GPU FBO blits with multi-surface coherence and fence/flush synchronization. Because recent Brave builds statically link ANGLE, Brave's V2 launcher passes **`--use-dynamic-angle`** so Brave loads `Libraries/libEGL.dylib` and `Libraries/libGLESv2.dylib` at runtime.
-- **Automatic Patch Selection (Patches 1–4 applied, 5–8 skipped):** When patching Brave (`python3 patch.py brave`), **Patches 1–4** are applied automatically and **Patches 5–8 are skipped automatically**:
+##### Chrome & Brave Default Mode (`angle_dylibs_tex2d/` + Patches 1–4)
+- **What `angle_dylibs_tex2d/` does:** Stock macOS ANGLE CGL only binds `IOSurface` buffers to `GL_TEXTURE_RECTANGLE` (`0x84f5`), which breaks Chromium M158+ `sampler2D` shaders (`GL_TEXTURE_2D`, `0x0de1`) for VideoToolbox decode, GMB video frames, webcam/ScreenCaptureKit, and Zero-Copy tiles. `angle_dylibs_tex2d/` contains a custom-built ANGLE CGL (`libEGL.dylib` + `libGLESv2.dylib`, reproducible from `patches/angle_cgl_iosurface_tex2d.patch`) that natively advertises `EGL_TEXTURE_2D` (`0x305f`) and bridges `GL_TEXTURE_2D` ↔ `IOSurface` via GPU FBO blits with multi-surface coherence and fence/flush synchronization. Because recent Chrome & Brave builds statically link ANGLE, their V2 launchers pass **`--use-dynamic-angle`** so Chromium loads `Libraries/libEGL.dylib` and `Libraries/libGLESv2.dylib` at runtime.
+- **Automatic Patch Selection (Patches 1–4 applied, 5–8 skipped):** When patching Google Chrome (`python3 patch.py chrome`) or Brave (`python3 patch.py brave`), **Patches 1–4** are applied automatically and **Patches 5–8 are skipped automatically**:
   - Patches 5, 6, and 7 (`GL_TEXTURE_RECTANGLE` `0x84f5` overrides) are no longer needed because `angle_dylibs_tex2d/` handles `GL_TEXTURE_2D` natively.
   - Patch 8 (`CreateDesktopCaptureDeviceMac` CPU fallback) is skipped so native macOS ScreenCaptureKit screen sharing remains enabled.
-  - Other browsers (`chrome`, `opera`, `vivaldi`, `helium`, `thorium`, `coccoc`) continue to use the pristine universal `angle_dylibs/` and `compat` profile unchanged.
+  - Other browsers (`opera`, `vivaldi`, `helium`, `thorium`, `coccoc`) continue to use the pristine universal `angle_dylibs/` and `compat` profile unchanged.
 
 ##### How to Use the V2 Launcher (`gpu_profiles.h`)
-The native C launcher (`brave_main.c`, `chrome_main.c`, etc.) includes [gpu_profiles.h](gpu_profiles.h), which selects a GPU profile at launch time in this priority order:
+The native C launcher (`chrome_main.c`, `brave_main.c`, etc.) includes [gpu_profiles.h](gpu_profiles.h), which selects a GPU profile at launch time in this priority order:
 1. **`CHROME_GPU_PROFILE`** environment variable (highest priority)
 2. **`--chromium-gpu-patch-profile=<name>`** command-line switch
-3. **Compile-time default** set when patching via `--profile <name>` (or alias `--gpu-profile <name>`): **`accelerated`** for Brave, **`compat`** for all other browsers
+3. **Compile-time default** set when patching via `--profile <name>` (or alias `--gpu-profile <name>`): **`accelerated`** for Chrome & Brave, **`compat`** for all other browsers
 
 Available profiles:
 
 | Profile | Injected Flags | Intended Use |
 | :--- | :--- | :--- |
-| `accelerated` | `--use-angle=gl`, `--use-dynamic-angle` *(Brave)*, `--ignore-gpu-blocklist`, `--disable-features=SkiaGraphite` | **Default for Brave.** Validated on Brave M158 with `angle_dylibs_tex2d/`: reinstates VideoToolbox hardware decode, GMB video frames, Accelerated 2D Canvas, Partial Raster, Webcam GMB, ScreenCaptureKit, and Zero-Copy. Only `SkiaGraphite` stays disabled (required on OCLP Monterey Metal drivers). |
-| `compat` | `--use-angle=gl`, `--use-dynamic-angle` *(Brave)*, `--ignore-gpu-blocklist`, plus all conservative `--disable-*` flags | **Default for Chrome/Opera/Vivaldi/etc.; safe fallback for Brave.** Disables zero-copy, HW video decode, GMB frames, 2D canvas, partial raster, and ScreenCaptureKit. |
-| `custom` | `--use-angle=gl`, `--use-dynamic-angle` *(Brave)*, `--ignore-gpu-blocklist` | Minimal base profile for ad-hoc flag experiments. |
+| `accelerated` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist`, `--disable-features=SkiaGraphite` | **Default for Chrome & Brave.** Validated on M158 with `angle_dylibs_tex2d/`: reinstates VideoToolbox hardware decode, GMB video frames, Accelerated 2D Canvas, Partial Raster, Webcam GMB, ScreenCaptureKit, and Zero-Copy. Only `SkiaGraphite` stays disabled (required on OCLP Monterey Metal drivers). |
+| `compat` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist`, plus all conservative `--disable-*` flags | **Default for Opera/Vivaldi/Helium/etc.; safe fallback for Chrome & Brave.** Disables zero-copy, HW video decode, GMB frames, 2D canvas, partial raster, and ScreenCaptureKit. |
+| `custom` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist` | Minimal base profile for ad-hoc flag experiments. |
 
 Common V2 launcher usage examples:
 
 ```bash
 # 1. Change the compiled-in default profile (persists for Finder/Dock launches)
-python3 patch.py brave --profile compat --force        # Switch Brave default to compat fallback
-python3 patch.py brave --profile accelerated --force   # Switch Brave default back to accelerated
+python3 patch.py chrome --profile compat --force        # Switch Chrome default to compat fallback
+python3 patch.py brave --profile compat --force         # Switch Brave default to compat fallback
+python3 patch.py chrome --profile accelerated --force   # Switch Chrome default back to accelerated
 
 # 2. Override profile for a single launch (no re-patching needed)
+CHROME_GPU_PROFILE=compat "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_GPU_PROFILE=compat "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --chromium-gpu-patch-profile=compat
 
@@ -155,11 +157,11 @@ CHROME_GPU_PROFILE=compat "/Applications/Brave Browser.app/Contents/MacOS/Brave 
 CHROME_GPU_DISABLE_FEATURES="FeatureA,FeatureB" \
 CHROME_GPU_ENABLE_FEATURES="FeatureC" \
 CHROME_GPU_EXTRA_FLAGS="--disable-partial-raster" \
-"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ```
 
 > [!NOTE]
-> On Brave, both `accelerated` and `compat` use the same 4-patch binary + `angle_dylibs_tex2d/` + `--use-dynamic-angle` layout, so you can switch freely between them at runtime (`CHROME_GPU_PROFILE=compat`) or via `--force` without restoring from backup. Any explicit Chromium switch you pass on the command line overrides the corresponding flag from the active profile, and `--disable-features=` / `--enable-features=` values are automatically merged and deduplicated.
+> On Chrome and Brave, both `accelerated` and `compat` use the same 4-patch binary + `angle_dylibs_tex2d/` + `--use-dynamic-angle` layout, so you can switch freely between them at runtime (`CHROME_GPU_PROFILE=compat`) or via `--force` without restoring from backup. Any explicit Chromium switch you pass on the command line overrides the corresponding flag from the active profile, and `--disable-features=` / `--enable-features=` values are automatically merged and deduplicated.
 
 
 #### 💻 Electron Apps (Opt-In Only — Skipped by `all`):
@@ -416,7 +418,7 @@ chrome-macpro-gpu-patch/
 ├── patchers/                       # Modular browser and Electron patchers
 │   ├── __init__.py                 # Registry of supported browsers and opt-in apps
 │   ├── base.py                     # BaseBrowserPatcher engine (codesigning, backup, patching)
-│   ├── chrome.py                   # Google Chrome patcher module (7 patterns)
+│   ├── chrome.py                   # Google Chrome patcher module (Patches 1-4 + angle_dylibs_tex2d/, skips 5-8)
 │   ├── brave.py                    # Brave Browser patcher module (Patches 1-4 + angle_dylibs_tex2d/, skips 5-8)
 │   ├── opera.py                    # Opera Browser patcher module (5 patterns + dylib inject)
 │   ├── helium.py                   # Helium Browser patcher module (7 patterns + GL factory bypass)
@@ -433,8 +435,8 @@ chrome-macpro-gpu-patch/
 ├── thorium_main.c                  # Thorium Browser native C launcher (flag injection)
 ├── update_vscode.sh                # Visual Studio Code automated updater script
 ├── setup_certificate.sh            # Script to create and install LocalCodeSigner certificate
-├── angle_dylibs/                   # Pristine universal ANGLE dylibs (Chrome/Opera/Vivaldi/etc.)
-├── angle_dylibs_tex2d/             # Custom GL_TEXTURE_2D IOSurface-bridged ANGLE CGL dylibs (Brave)
+├── angle_dylibs/                   # Pristine universal ANGLE dylibs (Opera/Vivaldi/Helium/etc.)
+├── angle_dylibs_tex2d/             # Custom GL_TEXTURE_2D IOSurface-bridged ANGLE CGL dylibs (Chrome & Brave)
 ├── patches/
 │   └── angle_cgl_iosurface_tex2d.patch # Reproducible ANGLE CGL GL_TEXTURE_2D IOSurface bridge patch
 ├── install_auto_patch_service.sh   # Background LaunchAgent service installer
