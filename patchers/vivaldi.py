@@ -24,15 +24,26 @@ class VivaldiPatcher(BaseBrowserPatcher):
     launcher_name = "Vivaldi"
     launcher_src = "vivaldi_main.c"
     backup_base_dir = "~/.vivaldi_macpro_backups"
+    default_gpu_profile = "accelerated"
+    default_skip_patches = (6, 7, 8)
+    use_dynamic_angle = True
+    angle_dylibs_dir = "angle_dylibs_tex2d"
 
     def is_already_patched(self, version):
         ver_dir = self.get_ver_dir(version)
         fw_bin = self.get_framework_bin(version)
         lib_egl = os.path.join(ver_dir, "Libraries/libEGL.dylib")
+        lib_gles = os.path.join(ver_dir, "Libraries/libGLESv2.dylib")
         launcher_dst = self.get_launcher_dst()
         gpu_helper = os.path.join(ver_dir, "Helpers/Vivaldi Helper (GPU).app")
 
-        if not os.path.exists(fw_bin) or not os.path.exists(lib_egl) or not os.path.exists(launcher_dst) or not os.path.exists(gpu_helper):
+        if (
+            not os.path.exists(fw_bin)
+            or not os.path.exists(lib_egl)
+            or not os.path.exists(lib_gles)
+            or not os.path.exists(launcher_dst)
+            or not os.path.exists(gpu_helper)
+        ):
             return False
 
         # 1. Check if Launcher is compiled and signed with LocalCodeSigner
@@ -44,41 +55,33 @@ class VivaldiPatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if Pattern 1, Pattern 2, and Patch 8 are patched
+        # 3. Check required binary patches (Patches 1-2; Patch 8 only if not skipped).
+        # With angle_dylibs_tex2d/ + --use-dynamic-angle, Patches 6-8 (IOSurface) are skipped by default.
+        skip_patches = getattr(self, "skip_patches", None)
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
         p1_patched = bytes.fromhex("84 c0 90 90 80 7d b8 00 74 cd 48 8b 45 b0")
         p2_patched = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00", re.DOTALL)
         p8_applied = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00", re.DOTALL)
         try:
             with open(fw_bin, "rb") as f:
                 data = f.read()
-                has_p1 = (data.find(p1_patched) != -1 or 
-                          bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\x48\x83\xf9\x09(?:.|\n){1,60}\x84\xc0\x90\x90\x80\x7d(.)\x00", data, re.DOTALL)) or
-                          bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\xe9.{4}\x90{5}", data, re.DOTALL)))
-                if not has_p1:
+                if 1 not in skip_patches:
+                    has_p1 = (
+                        data.find(p1_patched) != -1
+                        or bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\x48\x83\xf9\x09(?:.|\n){1,60}\x84\xc0\x90\x90\x80\x7d(.)\x00", data, re.DOTALL))
+                        or bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\xe9.{4}\x90{5}", data, re.DOTALL))
+                    )
+                    if not has_p1:
+                        return False
+                if 2 not in skip_patches and not p2_patched.search(data) and not re.search(rb"\x84\xc0\xe9.{4}\x90\x83\x7d.\x00\x0f\x85", data, re.DOTALL):
                     return False
-                if not p2_patched.search(data) and not re.search(rb"\x84\xc0\xe9.{4}\x90\x83\x7d.\x00\x0f\x85", data, re.DOTALL):
-                    return False
-                if not p8_applied.search(data):
+                if 8 not in skip_patches and not p8_applied.search(data):
                     return False
         except Exception:
             return False
 
         return True
-
-    def pre_patch_hook(self, version):
-        ver_dir = self.get_ver_dir(version)
-        lib_dir = os.path.join(ver_dir, "Libraries")
-        os.makedirs(lib_dir, exist_ok=True)
-        ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
-
-        for dylib in ["libEGL.dylib", "libGLESv2.dylib"]:
-            src = os.path.join(ref_angle_lib, dylib)
-            dst = os.path.join(lib_dir, dylib)
-            if os.path.exists(src):
-                print(f"[*] Copying clean {dylib} to {version}...")
-                safe_copy(src, dst)
-            else:
-                print(f"[!] Warning: Reference dylib not found at {src}")
 
     def get_patches(self, version):
         def patch_p1_allowed_gl(data: bytearray):
@@ -183,8 +186,8 @@ class VivaldiPatcher(BaseBrowserPatcher):
             return False
 
         def patch_p4_seatbelt(data: bytearray):
-            # Seatbelt IsSandboxed check bypass
-            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", re.DOTALL)
+            # 1. Chromium 153+ with mov rdi, [rbx + 0x88] in GpuMain
+            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b\xbb\x88\x00\x00\x00)", re.DOTALL)
             m = p4_re.search(data)
             if m:
                 jump_pos = m.start() + len(m.group(1))
@@ -192,11 +195,20 @@ class VivaldiPatcher(BaseBrowserPatcher):
                 data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
                 print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied successfully at {hex(jump_pos)}!")
                 return True
-            p4_applied_re = re.compile(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", re.DOTALL)
-            if p4_applied_re.search(data):
+            p4_applied_re = re.compile(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b", re.DOTALL)
+            if p4_applied_re.search(data) or data.find(b"\x85\xc0\x90\x90\x90\x90\x90\x90\x48\x8b\xbb\x88\x00\x00\x00") != -1:
                 print("[*] Patch 4 (Seatbelt IsSandboxed) is already applied.")
                 return True
-            # Static pattern fallback
+            # 2. Broader Seatbelt check in GpuMain (M157/M158 mov rdi, [rbx + 0x90] or any register)
+            p4_re2 = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b)", re.DOTALL)
+            m2 = p4_re2.search(data)
+            if m2:
+                jump_pos = m2.start() + len(m2.group(1))
+                jump_len = len(m2.group(2))
+                data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
+                print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied dynamically at {hex(jump_pos)}!")
+                return True
+            # 3. Static pattern fallback
             p4_static = bytes.fromhex("89 c7 31 f6 31 d2 31 c0 e8 8c fc f4 fe 85 c0 0f 84 8b 00 00 00 48 8b bb 88 00 00 00")
             idx = data.find(p4_static)
             if idx != -1:
@@ -265,7 +277,20 @@ class VivaldiPatcher(BaseBrowserPatcher):
                 print("[*] Patch 7 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
 
-            # 2. Direct byte pattern fallback
+            # 2. Modern Chromium M153-M158 ValidateTarget (stack frame 0x100..0x1ff, GL_TEXTURE_2D 0xde1, EGL_TEXTURE_2D 0x305f)
+            p7_modern_applied = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
+            if p7_modern_applied.search(data):
+                print("[*] Patch 7 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
+                return True
+            p7_modern_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
+            m_mod = p7_modern_re.search(data)
+            if m_mod:
+                offset = m_mod.start()
+                data[offset:offset+4] = b"\xb0\x01\xc3\x90"
+                print(f"[+] Patch 7 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied dynamically at {hex(offset)}!")
+                return True
+
+            # 3. Direct byte pattern fallback
             p7_exact = bytes.fromhex("55 48 89 e5 85 f6 74 15 8b 87 90 01 00 00")
             idx = data.find(p7_exact)
             if idx != -1:

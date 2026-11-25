@@ -26,6 +26,10 @@ class HeliumPatcher(BaseBrowserPatcher):
     launcher_name = "Helium"
     launcher_src = "helium_main.c"
     backup_base_dir = "~/.helium_macpro_backups"
+    default_gpu_profile = "accelerated"
+    default_skip_patches = (5, 6, 7, 8)
+    use_dynamic_angle = True
+    angle_dylibs_dir = "angle_dylibs_tex2d"
 
     def get_app_bundle_version(self):
         """Reads CFBundleShortVersionString or CFBundleVersion from Contents/Info.plist."""
@@ -136,10 +140,17 @@ class HeliumPatcher(BaseBrowserPatcher):
         ver_dir = self.get_ver_dir(version)
         fw_bin = self.get_framework_bin(version)
         lib_egl = os.path.join(ver_dir, "Libraries/libEGL.dylib")
+        lib_gles = os.path.join(ver_dir, "Libraries/libGLESv2.dylib")
         launcher_dst = self.get_launcher_dst()
         gpu_helper = os.path.join(ver_dir, "Helpers/Helium Helper (GPU).app")
 
-        if not os.path.exists(fw_bin) or not os.path.exists(lib_egl) or not os.path.exists(launcher_dst) or not os.path.exists(gpu_helper):
+        if (
+            not os.path.exists(fw_bin)
+            or not os.path.exists(lib_egl)
+            or not os.path.exists(lib_gles)
+            or not os.path.exists(launcher_dst)
+            or not os.path.exists(gpu_helper)
+        ):
             return False
 
         # 1. Check if Launcher is compiled and signed with LocalCodeSigner
@@ -151,11 +162,27 @@ class HeliumPatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if GetAllowedGLImplementation bypass is applied
+        # 3. Check required binary patches (Patches 1-2; Patch 7 only if not skipped).
+        # With angle_dylibs_tex2d/ + --use-dynamic-angle, Patches 5-8 are skipped by default.
+        skip_patches = getattr(self, "skip_patches", None)
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
+        p1_static = bytes.fromhex("84 c0 eb 06 90 90 90 90 90 90 48 8b 45 b0")
+        p2_patched = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00\x00\x00", re.DOTALL)
+        p7_applied = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00", re.DOTALL)
         try:
             with open(fw_bin, "rb") as f:
                 data = f.read()
-                if bytes.fromhex("84 c0 eb 06 90 90 90 90 90 90 48 8b 45 b0") not in data:
+                if 1 not in skip_patches:
+                    has_p1 = (
+                        p1_static in data
+                        or bool(re.search(rb"\x84\xc0\xeb\x06\x90{6}\x48\x8b\x45.", data, re.DOTALL))
+                    )
+                    if not has_p1:
+                        return False
+                if 2 not in skip_patches and not p2_patched.search(data):
+                    return False
+                if 7 not in skip_patches and not p7_applied.search(data):
                     return False
         except Exception:
             return False
@@ -219,7 +246,8 @@ class HeliumPatcher(BaseBrowserPatcher):
             return False
 
         def patch_p4_seatbelt(data: bytearray):
-            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", re.DOTALL)
+            # 1. Chromium 153+ with mov rdi, [rbx + 0x88] in GpuMain
+            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b\xbb\x88\x00\x00\x00)", re.DOTALL)
             m = p4_re.search(data)
             if m:
                 jump_pos = m.start() + len(m.group(1))
@@ -227,8 +255,17 @@ class HeliumPatcher(BaseBrowserPatcher):
                 data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
                 print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied successfully at 0x{jump_pos:x}!")
                 return True
-            elif re.search(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", data, re.DOTALL):
+            if re.search(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b", data, re.DOTALL):
                 print("[*] Patch 4 (Seatbelt IsSandboxed) is already applied.")
+                return True
+            # 2. Broader Seatbelt check in GpuMain (M157/M158 mov rdi, [rbx + 0x90] or any register)
+            p4_re2 = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b)", re.DOTALL)
+            m2 = p4_re2.search(data)
+            if m2:
+                jump_pos = m2.start() + len(m2.group(1))
+                jump_len = len(m2.group(2))
+                data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
+                print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied dynamically at 0x{jump_pos:x}!")
                 return True
             print("[!] Warning: Patch 4 (Seatbelt IsSandboxed) pattern not found!")
             return False
@@ -260,7 +297,7 @@ class HeliumPatcher(BaseBrowserPatcher):
             if data.find(p6_153_pat) != -1 or data.find(p6_pre_pat) != -1:
                 print("[*] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
-            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec\x30\x01\x00\x00", re.DOTALL)
+            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             if p6_applied_re.search(data):
                 print("[*] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
@@ -273,12 +310,13 @@ class HeliumPatcher(BaseBrowserPatcher):
                 print(f"[+] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied successfully at 0x{idx:x}!")
                 return True
 
-            # 2. Dynamic pattern specifically anchored to ScopedEGLSurfaceIOSurface::ValidateTarget (stack frame 0x130)
-            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec\x30\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00", re.DOTALL)
+            # 2. Dynamic pattern anchored to ScopedEGLSurfaceIOSurface::ValidateTarget
+            #    (M153-M158+: stack frame 0x100..0x1ff, cmp esi, GL_TEXTURE_2D (0xde1), cmp ..., EGL_TEXTURE_2D (0x305f))
+            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             m = p6_re.search(data)
             if m:
                 offset = m.start()
-                data[offset : offset + 20] = p6_153_pat
+                data[offset : offset + 4] = b"\xb0\x01\xc3\x90"
                 print(f"[+] Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied dynamically at 0x{offset:x}!")
                 return True
 
@@ -340,5 +378,5 @@ class HeliumPatcher(BaseBrowserPatcher):
             ("Patch 5 (IOSurfaceImageBackingFactory target 0x84f5)", patch_p5_iosurface_factory),
             ("Patch 6 (ScopedEGLSurfaceIOSurface::ValidateTarget)", patch_p6_validate_target),
             ("Patch 7 (IOSurfaceImageBacking gl_target_ = 0x84f5)", patch_p7_iosurface_backing),
-            ("Patch 8 (CreateDesktopCaptureDeviceMac fallback to CPU capturer)", patch_p8_desktop_capture),
+            ("Patch 8 (CreateDesktopCaptureDeviceMac fallback to CPU capturer)", patch_p8_desktop_capture, True),
         ]

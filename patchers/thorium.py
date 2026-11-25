@@ -26,15 +26,26 @@ class ThoriumPatcher(BaseBrowserPatcher):
     launcher_name = "Thorium"
     launcher_src = "thorium_main.c"
     backup_base_dir = "~/.thorium_macpro_backups"
+    default_gpu_profile = "accelerated"
+    default_skip_patches = (5, 6)
+    use_dynamic_angle = True
+    angle_dylibs_dir = "angle_dylibs_tex2d"
 
     def is_already_patched(self, version):
         ver_dir = self.get_ver_dir(version)
         fw_bin = self.get_framework_bin(version)
         lib_egl = os.path.join(ver_dir, "Libraries/libEGL.dylib")
+        lib_gles = os.path.join(ver_dir, "Libraries/libGLESv2.dylib")
         launcher_dst = self.get_launcher_dst()
         gpu_helper = os.path.join(ver_dir, "Helpers/Thorium Helper (GPU).app")
 
-        if not os.path.exists(fw_bin) or not os.path.exists(lib_egl) or not os.path.exists(launcher_dst) or not os.path.exists(gpu_helper):
+        if (
+            not os.path.exists(fw_bin)
+            or not os.path.exists(lib_egl)
+            or not os.path.exists(lib_gles)
+            or not os.path.exists(launcher_dst)
+            or not os.path.exists(gpu_helper)
+        ):
             return False
 
         # 1. Check if Launcher is compiled and signed with LocalCodeSigner
@@ -46,14 +57,25 @@ class ThoriumPatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if GetAllowedGLImplementation bypass is applied
+        # 3. Check required binary patches (Patches 1-2; Patch 6 only if not skipped).
+        # With angle_dylibs_tex2d/ + --use-dynamic-angle, Patches 5-6 (IOSurface) are skipped by default.
+        skip_patches = getattr(self, "skip_patches", None)
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
+        p2_th_applied = re.compile(rb"(?:\x84\xc0|\x45\x84[\xc0-\xff]).{1,30}\x90{6}.{1,60}\x48\xb8\x09\x00\x00\x00\x03\x00\x00\x00", re.DOTALL)
+        p2_std_applied = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00", re.DOTALL)
         try:
             with open(fw_bin, "rb") as f:
                 data = f.read()
-                if (bytes.fromhex("84 c0 eb 06 90 90 90 90 90 90 48 8b 45 b0") not in data
-                        and not re.search(rb"\x84\xc0\xeb\x06\x90{6}\x48\x8b\x45.", data, re.DOTALL)):
+                if 1 not in skip_patches:
+                    if (
+                        bytes.fromhex("84 c0 eb 06 90 90 90 90 90 90 48 8b 45 b0") not in data
+                        and not re.search(rb"\x84\xc0\xeb\x06\x90{6}\x48\x8b\x45.", data, re.DOTALL)
+                    ):
+                        return False
+                if 2 not in skip_patches and not p2_th_applied.search(data) and not p2_std_applied.search(data):
                     return False
-                if not re.search(rb"\xc7\x83\x88\x01\x00\x00\xf5\x84\x00\x00\x8a\x45.\x88\x83\x8c\x01\x00\x00", data, re.DOTALL):
+                if 6 not in skip_patches and not re.search(rb"\xc7\x83\x88\x01\x00\x00\xf5\x84\x00\x00\x8a\x45.\x88\x83\x8c\x01\x00\x00", data, re.DOTALL):
                     return False
         except Exception:
             return False
@@ -61,7 +83,7 @@ class ThoriumPatcher(BaseBrowserPatcher):
         return True
 
     def pre_patch_hook(self, version):
-        """Inject clean ANGLE dylibs into Libraries/ and check AVX2 support."""
+        """Check AVX2 host CPU support and inject ANGLE dylibs into Libraries/."""
         # 1. Check if host CPU supports AVX2 (Haswell+)
         try:
             res = subprocess.run(["sysctl", "-n", "machdep.cpu.leaf7_features"], capture_output=True, text=True)
@@ -72,22 +94,7 @@ class ThoriumPatcher(BaseBrowserPatcher):
         except Exception:
             pass
 
-        ver_dir = self.get_ver_dir(version)
-        lib_dir = os.path.join(ver_dir, "Libraries")
-        os.makedirs(lib_dir, exist_ok=True)
-        ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
-
-        for dylib in ["libEGL.dylib", "libGLESv2.dylib"]:
-            src = os.path.join(ref_angle_lib, dylib)
-            dst = os.path.join(lib_dir, dylib)
-            if not os.path.exists(dst):
-                if os.path.exists(src):
-                    print(f"[*] Copying clean {dylib} to Thorium {version}...")
-                    safe_copy(src, dst)
-                else:
-                    print(f"[!] Warning: Reference dylib not found at {src}")
-            else:
-                print(f"[*] Thorium {version} has native {dylib}, keeping original.")
+        super().pre_patch_hook(version)
 
     def get_patches(self, version):
         # Patch 1: GetAllowedGLImplementation (Force Allow OpenGL on macOS)
@@ -160,7 +167,8 @@ class ThoriumPatcher(BaseBrowserPatcher):
 
         # Patch 4: Seatbelt IsSandboxed check bypass
         def patch_p4_seatbelt(data: bytearray):
-            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", re.DOTALL)
+            # 1. Chromium 153+ with mov rdi, [rbx + 0x88] in GpuMain
+            p4_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b\xbb\x88\x00\x00\x00)", re.DOTALL)
             m = p4_re.search(data)
             if m:
                 jump_pos = m.start() + len(m.group(1))
@@ -168,8 +176,17 @@ class ThoriumPatcher(BaseBrowserPatcher):
                 data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
                 print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied successfully at 0x{jump_pos:x}!")
                 return True
-            elif re.search(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})(?:\x48\x8b\xbb\x88\x00\x00\x00|\x48\x8b)", data, re.DOTALL):
+            if re.search(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b", data, re.DOTALL):
                 print("[*] Patch 4 (Seatbelt IsSandboxed) is already applied.")
+                return True
+            # 2. Broader Seatbelt check in GpuMain (M157/M158 mov rdi, [rbx + 0x90] or any register)
+            p4_re2 = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b)", re.DOTALL)
+            m2 = p4_re2.search(data)
+            if m2:
+                jump_pos = m2.start() + len(m2.group(1))
+                jump_len = len(m2.group(2))
+                data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
+                print(f"[+] Patch 4 (Seatbelt IsSandboxed) applied dynamically at 0x{jump_pos:x}!")
                 return True
             print("[!] Warning: Patch 4 (Seatbelt IsSandboxed) pattern not found!")
             return False
@@ -181,7 +198,7 @@ class ThoriumPatcher(BaseBrowserPatcher):
             if data.find(p6_153_pat) != -1 or data.find(p6_pre_pat) != -1:
                 print("[*] Patch 5 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
-            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec\x30\x01\x00\x00", re.DOTALL)
+            p6_applied_re = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             if p6_applied_re.search(data):
                 print("[*] Patch 5 (ScopedEGLSurfaceIOSurface::ValidateTarget) is already applied.")
                 return True
@@ -193,11 +210,11 @@ class ThoriumPatcher(BaseBrowserPatcher):
                 print(f"[+] Patch 5 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied successfully at 0x{idx:x}!")
                 return True
 
-            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec\x30\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00", re.DOTALL)
+            p6_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
             m = p6_re.search(data)
             if m:
                 offset = m.start()
-                data[offset : offset + 20] = p6_153_pat
+                data[offset : offset + 4] = b"\xb0\x01\xc3\x90"
                 print(f"[+] Patch 5 (ScopedEGLSurfaceIOSurface::ValidateTarget) applied dynamically at 0x{offset:x}!")
                 return True
 

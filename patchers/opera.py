@@ -24,15 +24,26 @@ class OperaPatcher(BaseBrowserPatcher):
     launcher_name = "Opera"
     launcher_src = "opera_main.c"
     backup_base_dir = "~/.opera_macpro_backups"
+    default_gpu_profile = "accelerated"
+    default_skip_patches = (6, 7, 8)
+    use_dynamic_angle = True
+    angle_dylibs_dir = "angle_dylibs_tex2d"
 
     def is_already_patched(self, version):
         ver_dir = self.get_ver_dir(version)
         fw_bin = self.get_framework_bin(version)
         lib_egl = os.path.join(ver_dir, "Libraries/libEGL.dylib")
+        lib_gles = os.path.join(ver_dir, "Libraries/libGLESv2.dylib")
         launcher_dst = self.get_launcher_dst()
         gpu_helper = os.path.join(ver_dir, "Helpers/Opera Helper (GPU).app")
 
-        if not os.path.exists(fw_bin) or not os.path.exists(lib_egl) or not os.path.exists(launcher_dst) or not os.path.exists(gpu_helper):
+        if (
+            not os.path.exists(fw_bin)
+            or not os.path.exists(lib_egl)
+            or not os.path.exists(lib_gles)
+            or not os.path.exists(launcher_dst)
+            or not os.path.exists(gpu_helper)
+        ):
             return False
 
         # 1. Check if Launcher is compiled and signed with LocalCodeSigner
@@ -44,32 +55,34 @@ class OperaPatcher(BaseBrowserPatcher):
         if f"Authority={self.certificate_name}" not in res.stderr and f"Authority={self.certificate_name}" not in res.stdout:
             return False
 
-        # 3. Check if Patch 8 (gl_target_ = 0x84f5) is present in binary
-        p8_re = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00")
+        # 3. Check required binary patches (Patches 1-2; Patch 8 only if not skipped).
+        # With angle_dylibs_tex2d/ + --use-dynamic-angle, Patches 6-8 (IOSurface) are skipped by default.
+        skip_patches = getattr(self, "skip_patches", None)
+        if skip_patches is None:
+            skip_patches = set(self.default_skip_patches)
+        p1_patched = bytes.fromhex("84 c0 90 90 80 7d b8 00 74 cd 48 8b 45 b0")
+        p2_patched = re.compile(rb"\x84\xc0\xe9.{4}\x90\x48\xb8\x09\x00\x00\x00\x03\x00", re.DOTALL)
+        p8_re = re.compile(rb"\xc7\x83..\x00\x00\xf5\x84\x00\x00\x8a\x45(.)\x88\x83..\x00\x00", re.DOTALL)
         try:
             with open(fw_bin, "rb") as f:
                 data = f.read()
-                if not p8_re.search(data):
+                if 1 not in skip_patches:
+                    has_p1 = (
+                        data.find(p1_patched) != -1
+                        or bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\x48\x83\xf9\x09(?:.|\n){1,60}\x84\xc0\x90\x90\x80\x7d(.)\x00", data, re.DOTALL))
+                        or bool(re.search(rb"\x48\x89\xc1\x48\xc1\xe9\x20\xe9.{4}\x90{5}", data, re.DOTALL))
+                        or data.find(b"\x48\x89\xc1\x48\xc1\xe9\x20\xe9") != -1
+                    )
+                    if not has_p1:
+                        return False
+                if 2 not in skip_patches and not p2_patched.search(data) and not re.search(rb"\x84\xc0\xe9.{4}\x90\x83\x7d.\x00\x0f\x85", data, re.DOTALL):
+                    return False
+                if 8 not in skip_patches and not p8_re.search(data):
                     return False
         except Exception:
             return False
 
         return True
-
-    def pre_patch_hook(self, version):
-        ver_dir = self.get_ver_dir(version)
-        lib_dir = os.path.join(ver_dir, "Libraries")
-        os.makedirs(lib_dir, exist_ok=True)
-        ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
-
-        for dylib in ["libEGL.dylib", "libGLESv2.dylib"]:
-            src = os.path.join(ref_angle_lib, dylib)
-            dst = os.path.join(lib_dir, dylib)
-            if os.path.exists(src):
-                print(f"[*] Copying clean {dylib} to {version}...")
-                safe_copy(src, dst)
-            else:
-                print(f"[!] Warning: Reference dylib not found at {src}")
 
 
     def get_patches(self, version):
@@ -175,6 +188,7 @@ class OperaPatcher(BaseBrowserPatcher):
             return False
 
         def patch_p5_gpumain(data: bytearray):
+            # 1. Opera legacy GpuMain bypass pattern (M135-M136)
             p5_re = re.compile(rb"\x84\xc0\x0f\x85(....)\x48\xc7\x85\xa8\xfd\xff\xff(.)", re.DOTALL)
             m = p5_re.search(data)
             if m:
@@ -187,6 +201,27 @@ class OperaPatcher(BaseBrowserPatcher):
             already_re = re.compile(rb"\x84\xc0\xe9(....)\x90\x48\xc7\x85\xa8\xfd\xff\xff(.)", re.DOTALL)
             if already_re.search(data):
                 print("[*] Patch 5 (GpuMain Initialization Bypass) is already applied.")
+                return True
+            # 2. Modern Chromium M153-M158 Seatbelt IsSandboxed check in GpuMain
+            p5_sb_re = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b\xbb\x88\x00\x00\x00)", re.DOTALL)
+            m_sb = p5_sb_re.search(data)
+            if m_sb:
+                jump_pos = m_sb.start() + len(m_sb.group(1))
+                jump_len = len(m_sb.group(2))
+                data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
+                print(f"[+] Patch 5 (GpuMain Seatbelt IsSandboxed) applied successfully at {hex(jump_pos)}!")
+                return True
+            p5_sb_applied = re.compile(rb"\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0(?:\x90{2}|\x90{6})\x48\x8b", re.DOTALL)
+            if p5_sb_applied.search(data):
+                print("[*] Patch 5 (GpuMain Seatbelt IsSandboxed) is already applied.")
+                return True
+            p5_sb_re2 = re.compile(rb"(\x89\xc7\x31\xf6\x31\xd2\x31\xc0\xe8.{4}\x85\xc0)(\x0f\x84.{4}|\x74.)(\x48\x8b)", re.DOTALL)
+            m_sb2 = p5_sb_re2.search(data)
+            if m_sb2:
+                jump_pos = m_sb2.start() + len(m_sb2.group(1))
+                jump_len = len(m_sb2.group(2))
+                data[jump_pos : jump_pos + jump_len] = b"\x90" * jump_len
+                print(f"[+] Patch 5 (GpuMain Seatbelt IsSandboxed) applied dynamically at {hex(jump_pos)}!")
                 return True
             print("[!] Warning: Patch 5 (GpuMain Initialization Bypass) pattern not found!")
             return False
@@ -230,6 +265,18 @@ class OperaPatcher(BaseBrowserPatcher):
             if data.find(b"\xb0\x01\xc3\x90\x85\xf6") != -1:
                 print("[*] Patch 7 (ValidateTarget Always Return True) is already applied.")
                 return True
+            # Modern Chromium M153-M158 ValidateTarget (stack frame 0x100..0x1ff, GL_TEXTURE_2D 0xde1, EGL_TEXTURE_2D 0x305f)
+            p7_modern_applied = re.compile(rb"\xb0\x01\xc3\x90(?:\x41[\x50-\x57]|[\x50-\x57]){0,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
+            if p7_modern_applied.search(data):
+                print("[*] Patch 7 (ValidateTarget Always Return True) is already applied.")
+                return True
+            p7_modern_re = re.compile(rb"\x55\x48\x89\xe5(?:\x41[\x50-\x57]|[\x50-\x57]){1,4}\x48\x81\xec.\x01\x00\x00\x81\xfe\xe1\x0d\x00\x00.{1,16}\x5f\x30\x00\x00", re.DOTALL)
+            m_mod = p7_modern_re.search(data)
+            if m_mod:
+                offset = m_mod.start()
+                data[offset:offset+4] = b"\xb0\x01\xc3\x90"
+                print(f"[+] Patch 7 (ValidateTarget Always Return True) applied dynamically at {hex(offset)}!")
+                return True
             print("[!] Warning: Patch 7 (ValidateTarget Always Return True) pattern not found!")
             return False
 
@@ -258,7 +305,7 @@ class OperaPatcher(BaseBrowserPatcher):
             ("Patch 1 (GetAllowedGLImplementation)", patch_p1_allowed_gl),
             ("Patch 2 (GetDisplayInitializationParams)", patch_p2_display_init),
             ("Patch 3 (GpuMode fallback to HARDWARE_GL)", patch_p3_gpumode),
-            ("Patch 4 (GLDisplayEGL Initialization)", patch_p4_gldisplay),
+            ("Patch 4 (GLDisplayEGL Initialization)", patch_p4_gldisplay, True),
             ("Patch 5 (GpuMain Initialization Bypass)", patch_p5_gpumain),
             ("Patch 6 (IOSurface Factory Target 0x84f5)", patch_p6_iosurface_target),
             ("Patch 7 (ValidateTarget Always Return True)", patch_p7_validate_target),

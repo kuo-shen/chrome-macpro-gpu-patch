@@ -6,7 +6,33 @@
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <ctype.h>
 #include "gpu_profiles.h"
+
+static int compare_versions(const char *a, const char *b) {
+    const char *pa = a;
+    const char *pb = b;
+    while (*pa || *pb) {
+        if (*pa == '.') pa++;
+        if (*pb == '.') pb++;
+        if (!*pa && !*pb) break;
+        if (!*pa) return -1;
+        if (!*pb) return 1;
+        if (isdigit((unsigned char)*pa) && isdigit((unsigned char)*pb)) {
+            char *ea = NULL, *eb = NULL;
+            long va = strtol(pa, &ea, 10);
+            long vb = strtol(pb, &eb, 10);
+            if (va != vb) return (va > vb) ? 1 : -1;
+            pa = ea;
+            pb = eb;
+        } else {
+            if (*pa != *pb) return ((unsigned char)*pa > (unsigned char)*pb) ? 1 : -1;
+            pa++;
+            pb++;
+        }
+    }
+    return strcmp(a, b);
+}
 
 int main(int argc, char *argv[]) {
     char exec_path[1024];
@@ -27,8 +53,9 @@ int main(int argc, char *argv[]) {
     char best_ver[256] = "";
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] != '.' && strcmp(ent->d_name, "Current") != 0) {
-            if (strcmp(ent->d_name, best_ver) > 0) {
+            if (best_ver[0] == '\0' || compare_versions(ent->d_name, best_ver) > 0) {
                 strncpy(best_ver, ent->d_name, sizeof(best_ver) - 1);
+                best_ver[sizeof(best_ver) - 1] = '\0';
             }
         }
     }

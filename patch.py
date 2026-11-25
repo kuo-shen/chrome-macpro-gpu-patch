@@ -142,9 +142,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Simulate binary pattern patching without writing anything")
     parser.add_argument("--diagnose", action="store_true", help="Print launcher profile/flags, binary pattern match report, and a headless feature probe")
     parser.add_argument("--profile", "--gpu-profile", dest="profile", choices=GPU_PROFILES, default=None,
-                        help="GPU profile compiled as the launcher default (Chrome & Brave default to accelerated; other browsers default to compat)")
+                        help="GPU profile compiled as the launcher default (Chrome, Brave, Opera, Vivaldi, Helium & Thorium default to accelerated; CocCoc defaults to compat)")
     parser.add_argument("--skip-patches", type=str, default=None,
-                        help="Comma-separated 1-based binary patch numbers to skip (e.g. '8' or '5,6,7,8'; Chrome & Brave default to 5,6,7,8)")
+                        help="Comma-separated 1-based binary patch numbers to skip (e.g. '8' or '5,6,7,8'; defaults skip IOSurface patches per browser: Chrome/Brave/Helium 5-8, Opera/Vivaldi 6-8, Thorium 5-6)")
     parser.add_argument("--test-gpu", action="store_true", help="Run a live headless WebGL probe to verify active GPU hardware acceleration")
     parser.add_argument("--restore", action="store_true", help="Restore original binaries/executables from backup")
     parser.add_argument("--fix-permissions", action="store_true",

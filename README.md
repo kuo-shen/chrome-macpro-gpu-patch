@@ -119,26 +119,30 @@ python3 patch.py helium
   2. A binary pattern dry-run against the installed framework (showing applied vs. skipped patches).
   3. A live headless feature probe reporting the active ANGLE/GPU renderer, WebGL/2D Canvas/WebGPU status, camera/screen-capture API availability, and hardware vs. software decode for H.264, HEVC, VP9, and AV1.
 
-##### Chrome & Brave Default Mode (`angle_dylibs_tex2d/` + Patches 1–4)
-- **What `angle_dylibs_tex2d/` does:** Stock macOS ANGLE CGL only binds `IOSurface` buffers to `GL_TEXTURE_RECTANGLE` (`0x84f5`), which breaks Chromium M158+ `sampler2D` shaders (`GL_TEXTURE_2D`, `0x0de1`) for VideoToolbox decode, GMB video frames, webcam/ScreenCaptureKit, and Zero-Copy tiles. `angle_dylibs_tex2d/` contains a custom-built ANGLE CGL (`libEGL.dylib` + `libGLESv2.dylib`, reproducible from `patches/angle_cgl_iosurface_tex2d.patch`) that natively advertises `EGL_TEXTURE_2D` (`0x305f`) and bridges `GL_TEXTURE_2D` ↔ `IOSurface` via GPU FBO blits with multi-surface coherence and fence/flush synchronization. Because recent Chrome & Brave builds statically link ANGLE, their V2 launchers pass **`--use-dynamic-angle`** so Chromium loads `Libraries/libEGL.dylib` and `Libraries/libGLESv2.dylib` at runtime.
-- **Automatic Patch Selection (Patches 1–4 applied, 5–8 skipped):** When patching Google Chrome (`python3 patch.py chrome`) or Brave (`python3 patch.py brave`), **Patches 1–4** are applied automatically and **Patches 5–8 are skipped automatically**:
-  - Patches 5, 6, and 7 (`GL_TEXTURE_RECTANGLE` `0x84f5` overrides) are no longer needed because `angle_dylibs_tex2d/` handles `GL_TEXTURE_2D` natively.
-  - Patch 8 (`CreateDesktopCaptureDeviceMac` CPU fallback) is skipped so native macOS ScreenCaptureKit screen sharing remains enabled.
-  - Other browsers (`opera`, `vivaldi`, `helium`, `thorium`, `coccoc`) continue to use the pristine universal `angle_dylibs/` and `compat` profile unchanged.
+##### Default `accelerated` Mode (`angle_dylibs_tex2d/` + IOSurface Patches Skipped)
+- **What `angle_dylibs_tex2d/` does:** Stock macOS ANGLE CGL only binds `IOSurface` buffers to `GL_TEXTURE_RECTANGLE` (`0x84f5`), which breaks modern Chromium `sampler2D` shaders (`GL_TEXTURE_2D`, `0x0de1`) for VideoToolbox decode, GMB video frames, webcam/ScreenCaptureKit, and Zero-Copy tiles. `angle_dylibs_tex2d/` contains a custom-built ANGLE CGL (`libEGL.dylib` + `libGLESv2.dylib`, reproducible from `patches/angle_cgl_iosurface_tex2d.patch`) that natively advertises `EGL_TEXTURE_2D` (`0x305f`) and bridges `GL_TEXTURE_2D` ↔ `IOSurface` via GPU FBO blits with multi-surface coherence and fence/flush synchronization. Because recent Chromium builds statically link ANGLE, the V2 launcher passes **`--use-dynamic-angle`** so Chromium loads `Libraries/libEGL.dylib` and `Libraries/libGLESv2.dylib` at runtime (older dynamic-ANGLE milestones load those replaced dylibs directly and safely ignore `--use-dynamic-angle`).
+- **Automatic Per-Browser Patch Selection:**
+  - **Runtime-validated (M158):** **Google Chrome** and **Brave** — apply Patches 1–4 and automatically skip Patches **5–8** (`GL_TEXTURE_RECTANGLE` `0x84f5` overrides and `CreateDesktopCaptureDeviceMac` CPU fallback).
+  - **Extended (pending live runtime validation on installed bundles):**
+    - **Helium** — applies Patches 1–4, skips Patches **5–8**.
+    - **Opera** — applies Patches 1–5 (Patch 4 optional), skips Patches **6–8** (IOSurface overrides).
+    - **Vivaldi** — applies Patches 1–5 (Patch 5 non-fatal), skips Patches **6–8** (IOSurface overrides).
+    - **Thorium** — applies Patches 1–4, skips Patches **5–6** (IOSurface overrides).
+  - **Unchanged (`compat`):** **CocCoc** continues to use the pristine universal `angle_dylibs/` and `compat` profile.
 
 ##### How to Use the V2 Launcher (`gpu_profiles.h`)
-The native C launcher (`chrome_main.c`, `brave_main.c`, etc.) includes [gpu_profiles.h](gpu_profiles.h), which selects a GPU profile at launch time in this priority order:
+The native C launcher (`chrome_main.c`, `brave_main.c`, `opera_main.c`, `vivaldi_main.c`, `helium_main.c`, `thorium_main.c`, etc.) includes [gpu_profiles.h](gpu_profiles.h), which selects a GPU profile at launch time in this priority order:
 1. **`CHROME_GPU_PROFILE`** environment variable (highest priority)
 2. **`--chromium-gpu-patch-profile=<name>`** command-line switch
-3. **Compile-time default** set when patching via `--profile <name>` (or alias `--gpu-profile <name>`): **`accelerated`** for Chrome & Brave, **`compat`** for all other browsers
+3. **Compile-time default** set when patching via `--profile <name>` (or alias `--gpu-profile <name>`): **`accelerated`** for Chrome, Brave, Opera, Vivaldi, Helium & Thorium; **`compat`** for CocCoc
 
 Available profiles:
 
 | Profile | Injected Flags | Intended Use |
 | :--- | :--- | :--- |
-| `accelerated` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist`, `--disable-features=SkiaGraphite` | **Default for Chrome & Brave.** Validated on M158 with `angle_dylibs_tex2d/`: reinstates VideoToolbox hardware decode, GMB video frames, Accelerated 2D Canvas, Partial Raster, Webcam GMB, ScreenCaptureKit, and Zero-Copy. Only `SkiaGraphite` stays disabled (required on OCLP Monterey Metal drivers). |
-| `compat` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist`, plus all conservative `--disable-*` flags | **Default for Opera/Vivaldi/Helium/etc.; safe fallback for Chrome & Brave.** Disables zero-copy, HW video decode, GMB frames, 2D canvas, partial raster, and ScreenCaptureKit. |
-| `custom` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome & Brave)*, `--ignore-gpu-blocklist` | Minimal base profile for ad-hoc flag experiments. |
+| `accelerated` | `--use-angle=gl`, `--use-dynamic-angle` *(Chrome, Brave, Opera, Vivaldi, Helium, Thorium)*, `--ignore-gpu-blocklist`, `--disable-features=SkiaGraphite` | **Default for Chrome, Brave, Opera, Vivaldi, Helium & Thorium.** Runtime-validated on Chrome & Brave M158 with `angle_dylibs_tex2d/`: reinstates VideoToolbox hardware decode, GMB video frames, Accelerated 2D Canvas, Partial Raster, Webcam GMB, ScreenCaptureKit, and Zero-Copy. Only `SkiaGraphite` stays disabled (required on OCLP Monterey Metal drivers). |
+| `compat` | `--use-angle=gl`, `--use-dynamic-angle` *(when compiled with dynamic ANGLE)*, `--ignore-gpu-blocklist`, plus all conservative `--disable-*` flags | **Default for CocCoc; safe fallback for all other browsers.** Disables zero-copy, HW video decode, GMB frames, 2D canvas, partial raster, and ScreenCaptureKit. |
+| `custom` | `--use-angle=gl`, `--use-dynamic-angle` *(when compiled with dynamic ANGLE)*, `--ignore-gpu-blocklist` | Minimal base profile for ad-hoc flag experiments. |
 
 Common V2 launcher usage examples:
 
@@ -161,7 +165,7 @@ CHROME_GPU_EXTRA_FLAGS="--disable-partial-raster" \
 ```
 
 > [!NOTE]
-> On Chrome and Brave, both `accelerated` and `compat` use the same 4-patch binary + `angle_dylibs_tex2d/` + `--use-dynamic-angle` layout, so you can switch freely between them at runtime (`CHROME_GPU_PROFILE=compat`) or via `--force` without restoring from backup. Any explicit Chromium switch you pass on the command line overrides the corresponding flag from the active profile, and `--disable-features=` / `--enable-features=` values are automatically merged and deduplicated.
+> On browsers using `angle_dylibs_tex2d/` (Chrome, Brave, Opera, Vivaldi, Helium, Thorium), both `accelerated` and `compat` share the same binary-patch + `angle_dylibs_tex2d/` + `--use-dynamic-angle` layout, so you can switch freely between them at runtime (`CHROME_GPU_PROFILE=compat`) or via `--force` without restoring from backup. Any explicit Chromium switch you pass on the command line overrides the corresponding flag from the active profile, and `--disable-features=` / `--enable-features=` values are automatically merged and deduplicated.
 
 
 #### 💻 Electron Apps (Opt-In Only — Skipped by `all`):

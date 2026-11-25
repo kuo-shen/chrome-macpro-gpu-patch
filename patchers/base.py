@@ -85,6 +85,8 @@ class BaseBrowserPatcher:
     default_gpu_profile = DEFAULT_GPU_PROFILE
     default_skip_patches = ()
     use_dynamic_angle = False
+    angle_dylibs_dir = "angle_dylibs"
+    overwrite_angle_dylibs = False
 
     def __init__(self, repo_root=None, app_path=None):
         if repo_root is None:
@@ -332,23 +334,40 @@ class BaseBrowserPatcher:
                 subprocess.run(["bash", cert_script], check=True)
 
     def pre_patch_hook(self, version):
-        """Standard hook: inject clean ANGLE dylibs (libEGL.dylib, libGLESv2.dylib)."""
+        """Standard hook: inject bundled ANGLE dylibs (libEGL.dylib, libGLESv2.dylib)."""
         ver_dir = self.get_ver_dir(version)
         lib_dir = os.path.join(ver_dir, "Libraries")
         os.makedirs(lib_dir, exist_ok=True)
-        ref_angle_lib = os.path.join(self.repo_root, "angle_dylibs")
+        dylibs_dir = self.angle_dylibs_dir
+        ref_angle_lib = os.path.join(self.repo_root, dylibs_dir)
+        if not os.path.isdir(ref_angle_lib):
+            print(f"[!] Warning: {dylibs_dir}/ not found; falling back to angle_dylibs/")
+            dylibs_dir = "angle_dylibs"
+            ref_angle_lib = os.path.join(self.repo_root, dylibs_dir)
 
+        force_overwrite = self.overwrite_angle_dylibs or dylibs_dir != "angle_dylibs"
         for dylib in ["libEGL.dylib", "libGLESv2.dylib"]:
             src = os.path.join(ref_angle_lib, dylib)
             dst = os.path.join(lib_dir, dylib)
-            if not os.path.exists(dst):
+            if force_overwrite or not os.path.exists(dst):
                 if os.path.exists(src):
-                    print(f"[*] {self.name} {version} is missing {dylib}. Injecting bundled ANGLE dylib...")
+                    print(f"[*] Copying {dylibs_dir}/{dylib} to {version}...")
                     safe_copy(src, dst)
                 else:
                     print(f"[!] Warning: Reference dylib not found at {src}")
             else:
                 print(f"[*] {self.name} {version} has native {dylib}, keeping original.")
+
+    @staticmethod
+    def detect_angle_loading_mode(data):
+        """Inspect framework binary bytes for static vs dynamic ANGLE loading hints."""
+        has_dyn_switch = b"use-dynamic-angle\x00" in data
+        has_libegl = b"libEGL.dylib\x00" in data
+        if has_dyn_switch:
+            return "static ANGLE with --use-dynamic-angle switch"
+        if has_libegl:
+            return "dynamic ANGLE (loads Libraries/libEGL.dylib directly)"
+        return "static-only ANGLE (no --use-dynamic-angle switch found)"
 
     def post_patch_hook(self, version):
         """Standard hook: clean obsolete versions, ensure Versions/Current and framework root symlinks exist."""
@@ -425,6 +444,12 @@ class BaseBrowserPatcher:
         print(f"[*] {action} {self.name} framework binary ({os.path.getsize(fw_bin):,} bytes)...")
         with open(fw_bin, "rb") as f:
             data = bytearray(f.read())
+
+        angle_mode = self.detect_angle_loading_mode(data)
+        print(f"[*] ANGLE loading mode: {angle_mode}")
+        if self.use_dynamic_angle and angle_mode.startswith("static-only"):
+            print("    Warning: --use-dynamic-angle switch not found in framework binary; "
+                  "external Libraries/libEGL.dylib may not be loaded.")
 
         patches = self.get_patches(version)
         applied_count = 0
